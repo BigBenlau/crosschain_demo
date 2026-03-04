@@ -1,0 +1,33 @@
+{
+  "protocol": "wormhole",
+  "events": {
+    "LogMessagePublished": {
+      "topic0": "0x6eb224fb001ed210e379b335e35efe88672a8ce935d981a6896b27ffdf52a3b2",
+      "data_types_options": [
+        [
+          "uint64",
+          "uint32",
+          "bytes",
+          "uint8"
+        ],
+        [
+          "address",
+          "uint64",
+          "uint32",
+          "bytes",
+          "uint8"
+        ]
+      ]
+    },
+    "TransferRedeemed": {
+      "topic0": "0xcaf280c8cfeba144da67230d9b009c8f868a75bac9a528fa0474be1ba317c169",
+      "data_types_options": [
+        [
+          "uint16",
+          "bytes32",
+          "uint64"
+        ]
+      ]
+    }
+  }
+}

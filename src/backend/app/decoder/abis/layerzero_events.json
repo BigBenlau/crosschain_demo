@@ -1,0 +1,48 @@
+{
+  "protocol": "layerzero",
+  "events": {
+    "PacketSent": {
+      "topic0": "0x1ab700d4ced0c005b164c0f789fd09fcbb0156d4c2041b8a3bfbcd961cd1567f",
+      "data_types_options": [
+        [
+          "bytes",
+          "bytes",
+          "address"
+        ]
+      ]
+    },
+    "PacketVerified": {
+      "topic0": "0x0d87345f3d1c929caba93e1c3821b54ff3512e12b66aa3cfe54b6bcbc17e59b4",
+      "data_types_options": [
+        [
+          "(uint32,bytes32,uint64)",
+          "address",
+          "bytes32"
+        ]
+      ]
+    },
+    "PacketDelivered": {
+      "topic0": "0x3cd5e48f9730b129dc7550f0fcea9c767b7be37837cd10e55eb35f734f4bca04",
+      "data_types_options": [
+        [
+          "(uint32,bytes32,uint64)",
+          "address"
+        ]
+      ]
+    },
+    "LzReceiveAlert": {
+      "topic0": "0x7edfa10fe10193301ad8a8bea7e968c7bcabcc64981f368e3aeada40ce26ae2c",
+      "data_types_options": [
+        [
+          "(uint32,bytes32,uint64)",
+          "bytes32",
+          "uint256",
+          "uint256",
+          "bytes",
+          "bytes",
+          "bytes"
+        ]
+      ]
+    }
+  }
+}
