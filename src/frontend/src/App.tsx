@@ -38,6 +38,20 @@ function chainLabel(chainId: number | null): string {
   return `Chain ${chainId}`;
 }
 
+function chainNameFromKey(chainKey: string): string {
+  const normalized = chainKey.trim().toLowerCase();
+  if (!normalized) {
+    return "Target Chain";
+  }
+  if (normalized === "arbitrum") {
+    return "Arbitrum";
+  }
+  if (normalized === "ethereum") {
+    return "Ethereum";
+  }
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
 function statusTone(status: string): string {
   switch (status) {
     case "EXECUTED":
@@ -92,6 +106,7 @@ function DashboardPage() {
   const [errorText, setErrorText] = useState("");
   const [loadingList, setLoadingList] = useState(false);
   const [animatedIds, setAnimatedIds] = useState<string[]>([]);
+  const [targetChainName, setTargetChainName] = useState("Target Chain");
 
   const overview = useMemo(() => {
     const total = items.length;
@@ -103,6 +118,10 @@ function DashboardPage() {
 
   useEffect(() => {
     void loadLatest();
+  }, []);
+
+  useEffect(() => {
+    void loadTargetChainName();
   }, []);
 
   useEffect(() => {
@@ -160,6 +179,20 @@ function DashboardPage() {
     }
   }
 
+  async function loadTargetChainName() {
+    try {
+      const response = await fetch("/api/health");
+      if (!response.ok) {
+        return;
+      }
+      const payload = await response.json();
+      const chainKey = typeof payload?.targetChain === "string" ? payload.targetChain : "";
+      setTargetChainName(chainNameFromKey(chainKey));
+    } catch {
+      setTargetChainName("Target Chain");
+    }
+  }
+
   async function onSearchSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!query.trim()) {
@@ -196,7 +229,7 @@ function DashboardPage() {
         <div>
           <p className="eyebrow">Crosschain Security Dashboard</p>
           <h1>LayerZero / Wormhole Explorer</h1>
-          <p className="subtitle">實時查看 Ethereum ↔ Target Chain 雙向跨鏈交易，點擊可進入安全分析詳情。</p>
+          <p className="subtitle">實時查看 Ethereum ↔ {targetChainName} 雙向跨鏈交易，點擊可進入安全分析詳情。</p>
         </div>
 
         <form onSubmit={onSearchSubmit} className="search-form">
