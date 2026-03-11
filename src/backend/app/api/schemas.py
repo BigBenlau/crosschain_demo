@@ -54,6 +54,8 @@ class RiskReportItem(BaseModel):
     factors: list[str]
     summary: str | None
     analyzedAt: str | None
+    observations: list[str] | None = None
+    aiModel: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -105,6 +107,7 @@ class XChainTxDetail(BaseModel):
     decodedLogs: list[DecodedLogItem]
     latency: dict
     failure: str | None
+    ruleReport: RiskReportItem | None
     riskReport: RiskReportItem | None
 
 

@@ -36,6 +36,8 @@ export type RiskReport = {
   factors: string[];
   summary: string | null;
   analyzedAt: string | null;
+  observations?: string[] | null;
+  aiModel?: string | null;
 };
 
 export type GlobalStats = {
@@ -59,6 +61,7 @@ export type TxDetail = {
   decodedLogs: DecodedLogItem[];
   latency: Record<string, number | null>;
   failure: string | null;
+  ruleReport: RiskReport | null;
   riskReport: RiskReport | null;
 };
 

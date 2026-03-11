@@ -264,6 +264,7 @@ class RiskService:
             rule_fallback_ids: list[str] = []
             for item in batch_items:
                 assessment = assessments[item.canonical_id]
+                ai_applied = isinstance(assessment, AIAssessment)
                 if isinstance(assessment, AIAssessment):
                     ai_applied_ids.append(item.canonical_id)
                 else:
@@ -275,6 +276,7 @@ class RiskService:
                     assessment.score,
                     assessment.factors,
                     assessment.summary,
+                    ai_applied=ai_applied,
                 )
                 completed_ids.append(item.canonical_id)
 
@@ -312,7 +314,7 @@ class RiskService:
 
     def _build_batch_item(self, tx: XChainTx, timelines: list[XChainTimelineEvent]) -> BatchItem:
         """組裝單筆交易的批量輸入塊。"""
-        rule = self._rule_assessment(tx, timelines)
+        rule = self.build_rule_assessment(tx, timelines)
         prompt_block = self._build_tx_prompt_block(tx, timelines, rule)
         return BatchItem(
             canonical_id=tx.canonical_id,
@@ -322,7 +324,7 @@ class RiskService:
             prompt_block=prompt_block,
         )
 
-    def _rule_assessment(self, tx: XChainTx, timelines: list[XChainTimelineEvent]) -> RuleAssessment:
+    def build_rule_assessment(self, tx: XChainTx, timelines: list[XChainTimelineEvent]) -> RuleAssessment:
         """基於狀態、失敗分類與時間線完整性產生規則判定。"""
         factors: list[str] = []
         observations: list[str] = []
@@ -809,6 +811,7 @@ class RiskService:
         score: int,
         factors: list[str],
         summary: str,
+        ai_applied: bool,
     ) -> None:
         """更新或新增單筆風險報告。"""
         stmt = (
@@ -826,8 +829,8 @@ class RiskService:
         latest.risk_score = score
         latest.risk_factors_json = json.dumps(factors, ensure_ascii=False)
         latest.analysis_summary = summary
-        latest.ai_model = settings.ai_model if settings.ai_api_key else None
-        latest.prompt_version = PROMPT_VERSION
+        latest.ai_model = settings.ai_model if ai_applied and settings.ai_api_key else None
+        latest.prompt_version = PROMPT_VERSION if ai_applied else None
 
     def _dedupe_preserve_order(self, items: list[str]) -> list[str]:
         """對列表做去重並保持原順序。"""

@@ -329,9 +329,21 @@ button.ghost {
 }
 
 .row-actions {
-  margin-top: 10px;
+  margin-top: 0;
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+}
+
+.tx-list li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.tx-main {
+  min-width: 0;
 }
 
 .detail-grid {
@@ -424,6 +436,12 @@ button.ghost {
   line-height: 1.55;
   color: #d6e3ff;
   min-height: 220px;
+}
+
+.analysis-sections {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
 }
 
 @keyframes txInsertPulse {
@@ -585,5 +603,13 @@ button.ghost {
 
   .decode-grid {
     grid-template-columns: 1fr;
+  }
+
+  .tx-list li {
+    grid-template-columns: 1fr;
+  }
+
+  .row-actions {
+    justify-content: flex-start;
   }
 }

@@ -32,6 +32,7 @@ from app.api.schemas import (
 from app.db import SessionLocal, get_db
 from app.indexer import indexer_service
 from app.models import RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
+from app.risk import risk_service
 
 router = APIRouter(prefix="/api", tags=["xchain"])
 
@@ -93,6 +94,22 @@ def _to_risk_report(report: RiskReport | None) -> RiskReportItem | None:
         factors=factors,
         summary=report.analysis_summary,
         analyzedAt=_to_iso(report.analyzed_at),
+        observations=None,
+        aiModel=report.ai_model,
+    )
+
+
+def _to_rule_report(tx: XChainTx, timelines: list[XChainTimelineEvent]) -> RiskReportItem:
+    """將規則層判定轉為輸出模型。"""
+    rule = risk_service.build_rule_assessment(tx, timelines)
+    return RiskReportItem(
+        verdict=rule.verdict,
+        score=rule.score,
+        factors=rule.factors,
+        summary=rule.summary,
+        analyzedAt=None,
+        observations=rule.observations,
+        aiModel=None,
     )
 
 
@@ -248,7 +265,7 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
             dstTxHash=None,
             updatedAt=None,
         )
-        return XChainTxDetail(tx=empty, timeline=[], decodedLogs=[], latency={}, failure=None, riskReport=None)
+        return XChainTxDetail(tx=empty, timeline=[], decodedLogs=[], latency={}, failure=None, ruleReport=None, riskReport=None)
 
     timeline_stmt = (
         select(XChainTimelineEvent)
@@ -302,6 +319,7 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
         decodedLogs=decoded_logs,
         latency=latency,
         failure=tx.failure_category,
+        ruleReport=_to_rule_report(tx, ordered_timeline_rows),
         riskReport=_to_risk_report(risk_row),
     )
 

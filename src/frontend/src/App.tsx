@@ -95,6 +95,26 @@ function buildAiReportText(report: RiskReport | null): string {
   return lines.join("\n");
 }
 
+function buildRuleReportText(report: RiskReport | null): string {
+  if (!report) {
+    return "尚無規則分析結果。";
+  }
+
+  const lines = [
+    `Status: ${report.verdict}`,
+    `Score: ${report.score} / 100 (higher is safer)`,
+    "Summary:",
+    report.summary ?? "無摘要",
+    "",
+    "Rule Observations:",
+    report.observations && report.observations.length > 0 ? report.observations.map((item) => `- ${item}`).join("\n") : "- 無",
+    "",
+    "Rule Factors:",
+    report.factors.length > 0 ? report.factors.map((item) => `- ${item}`).join("\n") : "- 無",
+  ];
+  return lines.join("\n");
+}
+
 function formatDecodedJson(value: string | null): string {
   if (!value) {
     return "無";
@@ -446,7 +466,7 @@ function DashboardPage() {
           <p className="eyebrow">Crosschain Security Dashboard</p>
           <h1>跨鏈交易監測平台</h1>
           <p className="subtitle">
-            實時查看 Ethereum ↔ {targetChainName} 的 LayerZero / Wormhole 跨鏈交易，點擊可進入安全分析詳情。
+            實時查看 Ethereum ↔ {targetChainName} 的 LayerZero / Wormhole 跨鏈交易，點擊「查看細節」可進入安全分析詳情。
           </p>
           <p className="subtitle">
             數據統計起始區塊: Ethereum #{ethStartBlock ?? "-"} · {targetChainName} #{targetStartBlock ?? "-"}
@@ -545,17 +565,19 @@ function DashboardPage() {
           <ul className="tx-list">
             {items.map((item) => (
               <li key={item.canonicalId} className={animatedIds.includes(item.canonicalId) ? "is-new" : ""}>
-                <div className="row-top">
-                  <span className={`pill protocol ${item.protocol === "layerzero" ? "lz" : "wh"}`}>
-                    {item.protocol.toUpperCase()}
-                  </span>
-                  <span className={`pill ${statusTone(item.status)}`}>{item.status}</span>
-                </div>
-                <div className="row-mid mono">{shortHash(item.canonicalId, 18, 12)}</div>
-                <div className="row-bottom">
-                  <span>{chainLabel(item.srcChainId)}</span>
-                  <span>→</span>
-                  <span>{chainLabel(item.dstChainId)}</span>
+                <div className="tx-main">
+                  <div className="row-top">
+                    <span className={`pill protocol ${item.protocol === "layerzero" ? "lz" : "wh"}`}>
+                      {item.protocol.toUpperCase()}
+                    </span>
+                    <span className={`pill ${statusTone(item.status)}`}>{item.status}</span>
+                  </div>
+                  <div className="row-mid mono">{shortHash(item.canonicalId, 18, 12)}</div>
+                  <div className="row-bottom">
+                    <span>{chainLabel(item.srcChainId)}</span>
+                    <span>→</span>
+                    <span>{chainLabel(item.dstChainId)}</span>
+                  </div>
                 </div>
                 <div className="row-actions">
                   <button type="button" onClick={() => openDetail(item.canonicalId)}>
@@ -709,7 +731,18 @@ function TxDetailPage() {
               {detail?.riskReport?.verdict ?? "UNKNOWN"}
             </span>
           </div>
-          <div className="analysis-window mono">{buildAiReportText(detail?.riskReport ?? null)}</div>
+          <div className="analysis-sections">
+            <div>
+              <h3>Rule Analysis</h3>
+              <div className="analysis-window mono">{buildRuleReportText(detail?.ruleReport ?? null)}</div>
+            </div>
+            <div>
+              <h3>AI Analysis</h3>
+              <div className="analysis-window mono">
+                {detail?.riskReport?.aiModel ? buildAiReportText(detail.riskReport) : "尚無 AI 分析結果。"}
+              </div>
+            </div>
+          </div>
         </section>
 
         <section className="panel">
