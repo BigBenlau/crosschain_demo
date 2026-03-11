@@ -13,10 +13,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
+    GlobalStatsResponse,
     LatestResponse,
     RiskReportItem,
     SearchResponse,
@@ -86,6 +87,7 @@ def _build_latest_query(
     status: str | None,
     src_chain: int | None,
     dst_chain: int | None,
+    category: str | None,
 ):
     """建立 latest 列表查詢。"""
     stmt = select(XChainTx)
@@ -94,19 +96,30 @@ def _build_latest_query(
         filters.append(XChainTx.protocol == protocol)
     if status:
         filters.append(XChainTx.status == status)
+    if category:
+        normalized = category.strip().lower()
+        if normalized == "executed":
+            filters.append(XChainTx.status == "EXECUTED")
+        elif normalized == "in_progress":
+            filters.append(XChainTx.status.in_(("SENT", "VERIFIED")))
+        elif normalized == "attention":
+            filters.append(XChainTx.status.in_(("FAILED", "STUCK")))
     if src_chain is not None:
         filters.append(XChainTx.src_chain_id == src_chain)
     if dst_chain is not None:
         filters.append(XChainTx.dst_chain_id == dst_chain)
     if filters:
         stmt = stmt.where(and_(*filters))
-    return stmt.order_by(desc(XChainTx.updated_at), desc(XChainTx.canonical_id))
+    block_sort = func.coalesce(XChainTx.ethereum_block_number, -1)
+    log_sort = func.coalesce(XChainTx.ethereum_log_index, -1)
+    return stmt.order_by(desc(block_sort), desc(log_sort), desc(XChainTx.canonical_id))
 
 
 @router.get("/latest", response_model=LatestResponse)
 def latest(
     protocol: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     srcChain: int | None = Query(default=None),
     dstChain: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
@@ -115,12 +128,30 @@ def latest(
 ) -> LatestResponse:
     """回傳最新交易流（支援簡易游標分頁）。"""
     offset = _cursor_to_offset(cursor)
-    stmt = _build_latest_query(protocol, status, srcChain, dstChain).offset(offset).limit(limit + 1)
+    stmt = _build_latest_query(protocol, status, srcChain, dstChain, category).offset(offset).limit(limit + 1)
     rows = db.execute(stmt).scalars().all()
     has_more = len(rows) > limit
     items = rows[:limit]
     next_cursor = str(offset + limit) if has_more else None
     return LatestResponse(items=[_to_summary(item) for item in items], nextCursor=next_cursor)
+
+
+@router.get("/stats", response_model=GlobalStatsResponse)
+def global_stats(db: Session = Depends(get_db)) -> GlobalStatsResponse:
+    """回傳 xchain_txs 的全局統計值。"""
+    stmt = select(
+        func.count().label("total"),
+        func.sum(case((XChainTx.status == "EXECUTED", 1), else_=0)).label("executed"),
+        func.sum(case((XChainTx.status.in_(("SENT", "VERIFIED")), 1), else_=0)).label("risk_pending"),
+        func.sum(case((XChainTx.status.in_(("FAILED", "STUCK")), 1), else_=0)).label("attention"),
+    )
+    row = db.execute(stmt).one()
+    return GlobalStatsResponse(
+        total=int(row.total or 0),
+        executed=int(row.executed or 0),
+        riskPending=int(row.risk_pending or 0),
+        attention=int(row.attention or 0),
+    )
 
 
 @router.get("/search", response_model=SearchResponse)
@@ -210,14 +241,14 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
     )
 
 
-async def _stream_generator() -> AsyncIterator[bytes]:
+async def _stream_generator(category: str | None) -> AsyncIterator[bytes]:
     """SSE 生成器：按 indexer cycle 推送最新列表與增量 canonical id。"""
     last_cycle_seq = -1
     while True:
         snapshot = indexer_service.snapshot()
         if snapshot.last_cycle_seq != last_cycle_seq:
             with SessionLocal() as db:
-                stmt = select(XChainTx).order_by(desc(XChainTx.updated_at), desc(XChainTx.canonical_id)).limit(50)
+                stmt = _build_latest_query(None, None, None, None, category).limit(50)
                 rows = db.execute(stmt).scalars().all()
                 items = [_to_summary(row) for row in rows]
                 available_ids = {item.canonicalId for item in items}
@@ -236,6 +267,6 @@ async def _stream_generator() -> AsyncIterator[bytes]:
 
 
 @router.get("/stream")
-async def stream() -> StreamingResponse:
+async def stream(category: str | None = Query(default=None)) -> StreamingResponse:
     """SSE 實時推送端點。"""
-    return StreamingResponse(_stream_generator(), media_type="text/event-stream")
+    return StreamingResponse(_stream_generator(category), media_type="text/event-stream")

@@ -14,16 +14,19 @@ from app.api import router as api_router
 from app.config import settings
 from app.db import init_db
 from app.indexer import indexer_service
+from app.risk import risk_service
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    risk_service.start()
     indexer_service.start()
     try:
         yield
     finally:
         indexer_service.stop()
+        risk_service.stop()
 
 
 app = FastAPI(title="Crosschain MVP API", version="0.1.0", lifespan=lifespan)
@@ -33,11 +36,16 @@ app.include_router(api_router)
 @app.get("/api/health")
 def health() -> dict:
     snapshot = indexer_service.snapshot()
+    risk_snapshot = risk_service.snapshot()
     return {
         "api": "ok",
         "env": settings.app_env,
         "targetChain": settings.target_chain,
         "rpcConfigured": bool(settings.eth_rpc_url and settings.target_chain_rpc_url),
+        "configuredStartBlock": {
+            "ethereum": settings.eth_start_block,
+            "targetChain": settings.target_chain_start_block,
+        },
         "indexer": {
             "running": snapshot.running,
             "lastError": snapshot.last_error,
@@ -46,6 +54,13 @@ def health() -> dict:
             "lastIndexedBlockByChain": snapshot.last_indexed_block_by_chain,
             "lastChangedIds": snapshot.last_changed_ids,
             "lastChangedCount": snapshot.last_changed_count,
-            "lastRiskUpdatedCount": snapshot.last_risk_updated_count,
+            "lastRiskEnqueuedCount": snapshot.last_risk_enqueued_count,
+        },
+        "risk": {
+            "running": risk_snapshot.running,
+            "pendingCount": risk_snapshot.pending_count,
+            "lastError": risk_snapshot.last_error,
+            "lastEnqueuedIds": risk_snapshot.last_enqueued_ids,
+            "lastCompletedIds": risk_snapshot.last_completed_ids,
         },
     }

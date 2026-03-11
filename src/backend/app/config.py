@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     ai_base_url: str
     ai_model: str
     ai_timeout_seconds: int
+    ai_batch_size: int
+    ai_batch_max_size: int
+    ai_max_prompt_chars: int
+    ai_max_output_tokens: int
+    ai_temperature: float
 
     # 資料庫連線配置
     db_path: str

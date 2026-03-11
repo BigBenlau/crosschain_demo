@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 
-import { fetchLatest, fetchTx, searchTx } from "./api";
-import type { RiskReport, StreamLatestEvent, TxDetail, XChainTxSummary } from "./types";
+import { fetchGlobalStats, fetchLatest, fetchTx, searchTx } from "./api";
+import type { LatestCategory } from "./api";
+import type { GlobalStats, RiskReport, StreamLatestEvent, TxDetail, XChainTxSummary } from "./types";
 
 function shortHash(value: string | null, head = 10, tail = 8): string {
   if (!value) {
@@ -12,17 +13,6 @@ function shortHash(value: string | null, head = 10, tail = 8): string {
     return value;
   }
   return `${value.slice(0, head)}...${value.slice(-tail)}`;
-}
-
-function formatTime(value: string | null): string {
-  if (!value) {
-    return "-";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return date.toLocaleString();
 }
 
 function chainLabel(chainId: number | null): string {
@@ -87,9 +77,7 @@ function buildAiReportText(report: RiskReport | null): string {
 
   const lines = [
     `Status: ${report.verdict}`,
-    `Score: ${report.score}`,
-    report.analyzedAt ? `Analyzed At: ${new Date(report.analyzedAt).toLocaleString()}` : "Analyzed At: -",
-    "",
+    `Score: ${report.score} / 100 (higher is safer)`,
     "Summary:",
     report.summary ?? "無摘要",
     "",
@@ -99,78 +87,130 @@ function buildAiReportText(report: RiskReport | null): string {
   return lines.join("\n");
 }
 
+function categoryLabel(category: LatestCategory): string {
+  switch (category) {
+    case "executed":
+      return "Executed Top 50";
+    case "in_progress":
+      return "In Progress Top 50";
+    case "attention":
+      return "Need Attention Top 50";
+    default:
+      return "Total Top 50";
+  }
+}
+
 function DashboardPage() {
   const navigate = useNavigate();
   const [items, setItems] = useState<XChainTxSummary[]>([]);
+  const [overview, setOverview] = useState<GlobalStats>({
+    total: 0,
+    executed: 0,
+    riskPending: 0,
+    attention: 0,
+  });
   const [query, setQuery] = useState("");
   const [errorText, setErrorText] = useState("");
   const [loadingList, setLoadingList] = useState(false);
   const [animatedIds, setAnimatedIds] = useState<string[]>([]);
   const [targetChainName, setTargetChainName] = useState("Target Chain");
-
-  const overview = useMemo(() => {
-    const total = items.length;
-    const executed = items.filter((item) => item.status === "EXECUTED").length;
-    const riskPending = items.filter((item) => item.status === "SENT" || item.status === "VERIFIED").length;
-    const attention = items.filter((item) => item.status === "FAILED" || item.status === "STUCK").length;
-    return { total, executed, riskPending, attention };
-  }, [items]);
+  const [ethStartBlock, setEthStartBlock] = useState<number | null>(null);
+  const [targetStartBlock, setTargetStartBlock] = useState<number | null>(null);
+  const [activeCategory, setActiveCategory] = useState<LatestCategory>("total");
+  const [listMode, setListMode] = useState<"category" | "search">("category");
 
   useEffect(() => {
-    void loadLatest();
+    void loadLatest("total");
   }, []);
 
   useEffect(() => {
-    void loadTargetChainName();
+    void loadOverview();
   }, []);
 
   useEffect(() => {
+    void loadDashboardMeta();
+  }, []);
+
+  useEffect(() => {
+    if (listMode !== "category") {
+      return;
+    }
+
     const animationTimers = new Set<number>();
-    const source = new EventSource("/api/stream");
-    source.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as StreamLatestEvent;
-        if (!Array.isArray(payload.items)) {
-          return;
-        }
+    let source: EventSource | null = null;
+    let reconnectTimer: number | null = null;
+    let disposed = false;
 
-        setItems((previous) => {
-          const previousIds = new Set(previous.map((item) => item.canonicalId));
-          const inserted = (payload.insertedCanonicalIds || []).filter((id) => !previousIds.has(id));
-          if (inserted.length > 0) {
-            setAnimatedIds((current) => Array.from(new Set([...current, ...inserted])));
-            const timer = window.setTimeout(() => {
-              setAnimatedIds((current) => current.filter((itemId) => !inserted.includes(itemId)));
-              animationTimers.delete(timer);
-            }, 1600);
-            animationTimers.add(timer);
-          }
-          return payload.items;
-        });
-        setErrorText("");
-      } catch (error) {
-        setErrorText(String(error));
+    const connect = () => {
+      if (disposed) {
+        return;
       }
+
+      const params = new URLSearchParams();
+      if (activeCategory !== "total") {
+        params.set("category", activeCategory);
+      }
+      const suffix = params.toString();
+      source = new EventSource(suffix ? `/api/stream?${suffix}` : "/api/stream");
+      source.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as StreamLatestEvent;
+          if (!Array.isArray(payload.items)) {
+            return;
+          }
+
+          setItems((previous) => {
+            const previousIds = new Set(previous.map((item) => item.canonicalId));
+            const inserted = (payload.insertedCanonicalIds || []).filter((id) => !previousIds.has(id));
+            if (inserted.length > 0) {
+              setAnimatedIds((current) => Array.from(new Set([...current, ...inserted])));
+              const timer = window.setTimeout(() => {
+                setAnimatedIds((current) => current.filter((itemId) => !inserted.includes(itemId)));
+                animationTimers.delete(timer);
+              }, 1600);
+              animationTimers.add(timer);
+            }
+            return payload.items;
+          });
+          void loadOverview();
+          setErrorText("");
+        } catch (error) {
+          setErrorText(String(error));
+        }
+      };
+      source.onerror = () => {
+        source?.close();
+        if (reconnectTimer !== null) {
+          window.clearTimeout(reconnectTimer);
+        }
+        reconnectTimer = window.setTimeout(() => {
+          void loadLatest(activeCategory);
+          connect();
+        }, 3000);
+      };
     };
-    source.onerror = () => {
-      source.close();
-      setTimeout(() => {
-        void loadLatest();
-      }, 3000);
-    };
+
+    connect();
     return () => {
-      source.close();
+      disposed = true;
+      source?.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
       for (const timer of animationTimers) {
         window.clearTimeout(timer);
       }
     };
-  }, []);
+  }, [activeCategory, listMode]);
 
-  async function loadLatest() {
+  async function loadLatest(category: LatestCategory = activeCategory) {
     setLoadingList(true);
     try {
-      const latest = await fetchLatest();
+      const latest = await fetchLatest(category);
       setItems(latest);
+      setActiveCategory(category);
+      setListMode("category");
+      await loadOverview();
       setErrorText("");
     } catch (error) {
       setErrorText(String(error));
@@ -179,7 +219,26 @@ function DashboardPage() {
     }
   }
 
-  async function loadTargetChainName() {
+  async function loadOverview() {
+    const stats = await fetchGlobalStats();
+    setOverview(stats);
+  }
+
+  async function loadSearchResults(searchTerm: string) {
+    setLoadingList(true);
+    try {
+      const result = await searchTx(searchTerm);
+      setItems(result);
+      setListMode("search");
+      setErrorText("");
+    } catch (error) {
+      setErrorText(String(error));
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  async function loadDashboardMeta() {
     try {
       const response = await fetch("/api/health");
       if (!response.ok) {
@@ -187,37 +246,35 @@ function DashboardPage() {
       }
       const payload = await response.json();
       const chainKey = typeof payload?.targetChain === "string" ? payload.targetChain : "";
+      const configuredStartBlock = payload?.configuredStartBlock ?? {};
+      const ethereumStart = configuredStartBlock?.ethereum;
+      const targetChainStart = configuredStartBlock?.targetChain;
       setTargetChainName(chainNameFromKey(chainKey));
+      setEthStartBlock(typeof ethereumStart === "number" ? ethereumStart : null);
+      setTargetStartBlock(typeof targetChainStart === "number" ? targetChainStart : null);
     } catch {
       setTargetChainName("Target Chain");
+      setEthStartBlock(null);
+      setTargetStartBlock(null);
     }
   }
 
   async function onSearchSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!query.trim()) {
-      void loadLatest();
+      void loadLatest(activeCategory);
       return;
     }
-    setLoadingList(true);
-    try {
-      const result = await searchTx(query.trim());
-      setItems(result);
-      setErrorText("");
-    } catch (error) {
-      setErrorText(String(error));
-    } finally {
-      setLoadingList(false);
-    }
-  }
-
-  function clearSearch() {
-    setQuery("");
-    void loadLatest();
+    void loadSearchResults(query.trim());
   }
 
   function openDetail(canonicalId: string) {
     navigate(`/tx/${encodeURIComponent(canonicalId)}`);
+  }
+
+  function onCategorySelect(category: LatestCategory) {
+    setQuery("");
+    void loadLatest(category);
   }
 
   return (
@@ -228,8 +285,13 @@ function DashboardPage() {
       <header className="hero">
         <div>
           <p className="eyebrow">Crosschain Security Dashboard</p>
-          <h1>LayerZero / Wormhole Explorer</h1>
-          <p className="subtitle">實時查看 Ethereum ↔ {targetChainName} 雙向跨鏈交易，點擊可進入安全分析詳情。</p>
+          <h1>跨鏈交易監測平台</h1>
+          <p className="subtitle">
+            實時查看 Ethereum ↔ {targetChainName} 的 LayerZero / Wormhole 跨鏈交易，點擊可進入安全分析詳情。
+          </p>
+          <p className="subtitle">
+            數據統計起始區塊: Ethereum #{ethStartBlock ?? "-"} · {targetChainName} #{targetStartBlock ?? "-"}
+          </p>
         </div>
 
         <form onSubmit={onSearchSubmit} className="search-form">
@@ -239,38 +301,54 @@ function DashboardPage() {
             onChange={(event) => setQuery(event.target.value)}
           />
           <button type="submit">Search</button>
-          <button type="button" className="ghost" onClick={clearSearch}>
-            Reset
-          </button>
         </form>
       </header>
 
       {errorText && <p className="error">{errorText}</p>}
 
       <section className="stats">
-        <article className="stat-card">
+        <button
+          type="button"
+          className={`stat-card ${listMode === "category" && activeCategory === "total" ? "is-active" : ""}`}
+          onClick={() => onCategorySelect("total")}
+        >
           <span>Total</span>
           <strong>{overview.total}</strong>
-        </article>
-        <article className="stat-card">
+        </button>
+        <button
+          type="button"
+          className={`stat-card ${listMode === "category" && activeCategory === "executed" ? "is-active" : ""}`}
+          onClick={() => onCategorySelect("executed")}
+        >
           <span>Executed</span>
           <strong>{overview.executed}</strong>
-        </article>
-        <article className="stat-card">
+        </button>
+        <button
+          type="button"
+          className={`stat-card ${listMode === "category" && activeCategory === "in_progress" ? "is-active" : ""}`}
+          onClick={() => onCategorySelect("in_progress")}
+        >
           <span>In Progress</span>
           <strong>{overview.riskPending}</strong>
-        </article>
-        <article className="stat-card">
+        </button>
+        <button
+          type="button"
+          className={`stat-card ${listMode === "category" && activeCategory === "attention" ? "is-active" : ""}`}
+          onClick={() => onCategorySelect("attention")}
+        >
           <span>Need Attention</span>
           <strong>{overview.attention}</strong>
-        </article>
+        </button>
       </section>
 
       <main className="dashboard-layout">
         <section className="panel">
           <div className="panel-header">
-            <h2>Latest Stream</h2>
-            <button className="ghost" onClick={() => void loadLatest()}>
+            <h2>{listMode === "search" ? "Search Results" : categoryLabel(activeCategory)}</h2>
+            <button
+              className="ghost"
+              onClick={() => (listMode === "search" && query.trim() ? void loadSearchResults(query.trim()) : void loadLatest())}
+            >
               {loadingList ? "Refreshing..." : "Refresh"}
             </button>
           </div>
@@ -289,7 +367,6 @@ function DashboardPage() {
                   <span>{chainLabel(item.srcChainId)}</span>
                   <span>→</span>
                   <span>{chainLabel(item.dstChainId)}</span>
-                  <span className="muted">{formatTime(item.updatedAt)}</span>
                 </div>
                 <div className="row-actions">
                   <button type="button" onClick={() => openDetail(item.canonicalId)}>
@@ -418,9 +495,9 @@ function TxDetailPage() {
                   </div>
                   <div className="timeline-body">
                     <p>{item.eventName ?? "Unknown Event"}</p>
-                    <p className="mono">{shortHash(item.txHash, 20, 14)}</p>
+                    <p className="mono">Tx: {item.txHash ?? "-"}</p>
                     <p className="muted">
-                      {chainLabel(item.chainId)} · block {item.blockNumber ?? "-"} · {formatTime(item.eventTs)}
+                      {chainLabel(item.chainId)} · block {item.blockNumber ?? "-"}
                     </p>
                   </div>
                 </li>

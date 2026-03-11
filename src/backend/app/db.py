@@ -8,7 +8,7 @@
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -22,8 +22,55 @@ engine = create_engine(settings.db_path, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def _column_names(table_name: str) -> set[str]:
+    inspector = inspect(engine)
+    return {column["name"] for column in inspector.get_columns(table_name)}
+
+
+def _index_names(table_name: str) -> set[str]:
+    inspector = inspect(engine)
+    return {index["name"] for index in inspector.get_indexes(table_name)}
+
+
+def _ensure_schema_compat() -> None:
+    with engine.begin() as conn:
+        xchain_txs_columns = _column_names("xchain_txs")
+        if "ethereum_block_number" not in xchain_txs_columns:
+            conn.execute(text("ALTER TABLE xchain_txs ADD COLUMN ethereum_block_number BIGINT"))
+        if "ethereum_log_index" not in xchain_txs_columns:
+            conn.execute(text("ALTER TABLE xchain_txs ADD COLUMN ethereum_log_index INTEGER"))
+
+        raw_log_columns = _column_names("raw_logs")
+        if "block_timestamp" not in raw_log_columns:
+            conn.execute(text("ALTER TABLE raw_logs ADD COLUMN block_timestamp DATETIME"))
+
+        xchain_txs_indexes = _index_names("xchain_txs")
+        if "ix_xchain_txs_src_timestamp" not in xchain_txs_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_src_timestamp ON xchain_txs (src_timestamp)"))
+
+        raw_logs_indexes = _index_names("raw_logs")
+        if "ix_raw_logs_block_timestamp" not in raw_logs_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_raw_logs_block_timestamp ON raw_logs (block_timestamp)"))
+        if "ix_xchain_txs_ethereum_block_number" not in xchain_txs_indexes:
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_ethereum_block_number ON xchain_txs (ethereum_block_number)")
+            )
+        if "ix_xchain_txs_ethereum_log_index" not in xchain_txs_indexes:
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_ethereum_log_index ON xchain_txs (ethereum_log_index)")
+            )
+        if "ix_xchain_txs_eth_order" not in xchain_txs_indexes:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_xchain_txs_eth_order "
+                    "ON xchain_txs (ethereum_block_number, ethereum_log_index)"
+                )
+            )
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _ensure_schema_compat()
 
 
 def get_db() -> Generator[Session, None, None]:

@@ -25,6 +25,7 @@
   - `dst_chain_id IS NOT NULL`
 - `src_chain_id/dst_chain_id` 需符合 `{1, target_chain_id}` 配對（方向可互換）。
 - 單邊或非目標鏈對事件不會寫入 `xchain_txs`（僅保留在 `raw_logs` 作鏈上原始證據）。
+- 若後續 reorg 使某筆交易失去有效雙邊證據，normalizer 會同步清理主表與關聯表資料。
 
 ## `xchain_txs`
 用途：統一跨鏈交易主表（一筆 canonical 交易一行）。
@@ -35,7 +36,9 @@
 | `protocol` | `String(32)` | 否 | `INDEX` | 協議名稱（`layerzero` / `wormhole`）。 |
 | `src_chain_id` | `Integer` | 是 | `INDEX` | 源鏈 chain id。 |
 | `src_tx_hash` | `String(80)` | 是 | `INDEX` | 源鏈交易哈希。 |
-| `src_timestamp` | `DateTime(timezone=True)` | 是 | - | 源鏈事件時間。 |
+| `src_timestamp` | `DateTime(timezone=True)` | 是 | `INDEX` | 源鏈發起事件時間；若未額外查 block RPC，通常為空。 |
+| `ethereum_block_number` | `BIGINT` | 是 | `INDEX` | Ethereum 主網側最早事件的區塊高度，供 latest 排序使用。 |
+| `ethereum_log_index` | `Integer` | 是 | `INDEX` | Ethereum 主網側最早事件的 log index，與 `ethereum_block_number` 組合排序。 |
 | `dst_chain_id` | `Integer` | 是 | `INDEX` | 目的鏈 chain id。 |
 | `dst_tx_hash` | `String(80)` | 是 | `INDEX` | 目的鏈交易哈希。 |
 | `dst_timestamp` | `DateTime(timezone=True)` | 是 | - | 目的鏈事件時間。 |
@@ -60,7 +63,7 @@
 | `block_number` | `BIGINT` | 是 | `INDEX` | 區塊高度。 |
 | `log_index` | `Integer` | 是 | - | 該交易中的 log 序號。 |
 | `event_name` | `String(64)` | 是 | - | 原始事件名。 |
-| `event_ts` | `DateTime(timezone=True)` | 是 | - | 事件時間。 |
+| `event_ts` | `DateTime(timezone=True)` | 是 | - | 事件時間；僅當系統額外取得區塊 timestamp 時可回填。 |
 | `evidence_json` | `Text` | 是 | - | 事件證據（JSON 字串）。 |
 
 ## `raw_logs`
@@ -77,6 +80,7 @@
 | `block_number` | `BIGINT` | 否 | `INDEX` | 區塊高度。 |
 | `tx_hash` | `String(80)` | 否 | `INDEX` | 交易哈希。 |
 | `log_index` | `Integer` | 否 | 唯一約束成員 | 交易中的 log 序號。 |
+| `block_timestamp` | `DateTime(timezone=True)` | 是 | `INDEX` | 所在區塊時間；當前默認不主動請求 block RPC，因此通常為空。 |
 | `topic0` | `String(80)` | 是 | `INDEX` | 事件 topic0。 |
 | `data` | `Text` | 是 | - | 原始 data 欄位。 |
 | `decoded_json` | `Text` | 是 | - | 解析後內容（JSON 字串）。 |
@@ -109,6 +113,13 @@
 | `key_value` | `String(191)` | 否 | `INDEX` | 查詢鍵值。 |
 | `canonical_id` | `String(191)` | 否 | `FK -> xchain_txs.canonical_id`, `INDEX` | 關聯主交易 ID。 |
 | `source` | `String(32)` | 否 | `INDEX` | 來源（`onchain` / `onchain_derived`）。 |
+
+目前實際寫入：
+- `canonicalId`
+- `txHash`
+
+目前未寫入：
+- `address`
 
 ## `risk_reports`
 用途：保存每筆跨鏈交易的安全分析結果（規則 + AI）。
@@ -146,3 +157,10 @@ WHERE src_chain_id IS NOT NULL
     (src_chain_id = :target_chain_id AND dst_chain_id = 1)
   );
 ```
+
+## 實作備註
+- `updated_at` 會作為 `STUCK` 超時判斷的主要時間基準。
+- `risk_reports` 不是歷史版本表；目前代碼會更新同一筆交易的最新分析結果。
+- `latency_ms_total`、`latency_ms_verify`、`latency_ms_execute` 欄位目前仍保留為空。
+- `eth_getLogs` 的 log 本身不包含區塊 timestamp，因此若不額外調 `eth_getBlockByNumber`，`src_timestamp/event_ts/block_timestamp` 會保持為空。
+- `latest` 目前按 `ethereum_block_number DESC, ethereum_log_index DESC` 排序；這表示按 Ethereum 主網側事件位置排序，而不是按 UTC 時間排序。

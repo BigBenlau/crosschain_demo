@@ -27,6 +27,13 @@ export type RiskReport = {
   analyzedAt: string | null;
 };
 
+export type GlobalStats = {
+  total: number;
+  executed: number;
+  riskPending: number;
+  attention: number;
+};
+
 export type TxDetail = {
   tx: XChainTxSummary;
   timeline: TimelineItem[];

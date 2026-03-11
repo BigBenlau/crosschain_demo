@@ -8,14 +8,11 @@
 """
 
 import json
-import logging
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
 
@@ -25,41 +22,14 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.decoder import decode_log
 from app.db import SessionLocal
+from app.logging_utils import build_backend_file_logger
 from app.models import IndexerCursor, RawLog
 from app.normalizer import normalizer_service
 from app.registry import get_chain_registry, get_protocol_registry
 from app.risk import risk_service
 
 
-def _build_indexer_logger() -> logging.Logger:
-    """建立 indexer 專用 logger，並將日誌寫入 backend/logs/indexer.log。"""
-    logger = logging.getLogger("xchain.indexer")
-    if logger.handlers:
-        return logger
-
-    log_dir = Path(__file__).resolve().parents[2] / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "indexer.log"
-
-    handler = RotatingFileHandler(
-        filename=log_file,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
-
-
-logger = _build_indexer_logger()
+logger = build_backend_file_logger("xchain.indexer", "indexer.log")
 
 
 def _hex_to_int(value: Any) -> int | None:
@@ -221,7 +191,7 @@ class IndexerSnapshot:
     last_cycle_seq: int
     last_changed_ids: list[str]
     last_changed_count: int
-    last_risk_updated_count: int
+    last_risk_enqueued_count: int
 
 
 class IndexerService:
@@ -279,7 +249,7 @@ class IndexerService:
                 last_cycle_seq=self._last_cycle_seq,
                 last_changed_ids=list(self._last_changed_ids),
                 last_changed_count=len(self._last_changed_ids),
-                last_risk_updated_count=len(self._last_risk_updated_ids),
+                last_risk_enqueued_count=len(self._last_risk_updated_ids),
             )
 
     def _run_loop(self) -> None:
@@ -365,7 +335,7 @@ class IndexerService:
 
             # 階段 3：正規化與風險分析。
             # - normalize：將 raw_logs 聚合為 xchain_txs / timeline / search_index
-            # - risk：僅對本輪變更交易執行風險評估
+            # - risk：將本輪變更交易送入異步風險評審隊列
             changed_ids = normalizer_service.normalize_all(db, dual_chain_pair=dual_chain_pair)
             risk_updated = risk_service.analyze_transactions(db, changed_ids)
 
@@ -516,8 +486,17 @@ class IndexerService:
         sent_sender_filter_set: set[str],
     ) -> int:
         """將 RPC logs 寫入 `raw_logs`，同位置資料以更新方式去重。"""
+        # 階段 1：初始化本批次寫入計數器。
         upserted_count = 0
+
+        # 階段 2：逐筆處理 RPC 回傳 log。
+        # 每筆 log 依序完成：
+        # - 提取核心鍵值（tx_hash/log_index/block_number/topic0）
+        # - 協議特定過濾（Wormhole SENT sender 白名單）
+        # - 解碼並序列化 decoded_json
+        # - 以 (chain_id, tx_hash, log_index) 做 upsert
         for entry in logs:
+            # 2.1 解析原始欄位並標準化格式。
             tx_hash = (entry.get("transactionHash") or "").lower()
             log_index = _hex_to_int(entry.get("logIndex"))
             block_number = _hex_to_int(entry.get("blockNumber"))
@@ -526,9 +505,11 @@ class IndexerService:
             topic0 = topic0_raw.lower() if isinstance(topic0_raw, str) else topic0_raw
             removed = bool(entry.get("removed", False))
 
+            # 2.2 Wormhole SENT 額外過濾：非 TokenBridge sender 直接跳過。
             if self._should_skip_wormhole_sent_log(protocol_key, topic0, topics, sent_topic_set, sent_sender_filter_set):
                 continue
 
+            # 2.3 協議事件 decode（供 normalizer 生成 canonical 與方向判定）。
             decoded_payload = decode_log(
                 protocol=protocol_key,
                 chain_id=chain_id,
@@ -538,14 +519,17 @@ class IndexerService:
             )
             decoded_json = json.dumps(decoded_payload, ensure_ascii=False) if decoded_payload else None
 
+            # 2.4 基本合法性檢查：缺少定位鍵則無法入庫。
             if not tx_hash or log_index is None or block_number is None:
                 continue
 
+            # 2.5 以唯一鍵查詢是否已存在（chain_id + tx_hash + log_index）。
             stmt = select(RawLog).where(
                 RawLog.chain_id == chain_id, RawLog.tx_hash == tx_hash, RawLog.log_index == log_index
             )
             existing = db.execute(stmt).scalar_one_or_none()
 
+            # 2.6 存在則更新（含 reorg removed 與最新 decode 結果）。
             if existing:
                 existing.protocol = protocol_key
                 existing.block_number = block_number
@@ -555,6 +539,7 @@ class IndexerService:
                 existing.removed = removed
                 upserted_count += 1
             else:
+                # 2.7 不存在則新增。
                 db.add(
                     RawLog(
                         protocol=protocol_key,
@@ -569,6 +554,8 @@ class IndexerService:
                     )
                 )
                 upserted_count += 1
+
+        # 階段 3：返回本批次成功 upsert 的筆數（新增 + 更新）。
         return upserted_count
 
     def _should_skip_wormhole_sent_log(

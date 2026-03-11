@@ -28,7 +28,8 @@
    - 套用 `STUCK` 規則
 4. 接著呼叫 `risk/service.py`：
    - 先規則判定風險
-   - 若有 `AI_API_KEY`，補充 AI 摘要
+   - 將本輪變更交易送入待檢查池
+   - 由背景 worker 按批次調用 AI 分析多筆交易
    - 寫入 `risk_reports`
 5. `api/routes.py` 對外提供查詢與 SSE 推送
 
@@ -39,6 +40,9 @@
 - 新增配置時，需同步：
   - `src/backend/.env.example`
   - 涉及模組的使用邏輯
+- AI 相關配置目前包含：
+  - 基礎調模：`AI_API_KEY/AI_BASE_URL/AI_MODEL/AI_TIMEOUT_SECONDS`
+  - 批量控制：`AI_BATCH_SIZE/AI_BATCH_MAX_SIZE/AI_MAX_PROMPT_CHARS/AI_MAX_OUTPUT_TOKENS/AI_TEMPERATURE`
 
 ### `models/tables.py`
 - 是資料結構單一來源（schema source of truth）
@@ -54,7 +58,11 @@
 - 提供 LayerZero / Wormhole topic 配置
 - 支援階段化 topic：
   - `SENT/VERIFIED/EXECUTED/FAILED`
-- 若未提供階段化配置，會回退到舊版 `*_TOPIC0S`
+- 若未提供階段化配置，會按已知 topic 簽名回退到對應 stage
+- Wormhole 地址白名單同時包含：
+  - core contracts
+  - token bridge contracts
+- Wormhole 的 sender filter 僅用於 `SENT` 事件額外過濾非 bridge sender
 
 ### `indexer/service.py`
 - 負責鏈上讀取，嚴格不使用協議 offchain 資料源
@@ -77,24 +85,59 @@
 - 將協議事件映射為統一狀態：
   - `SENT/VERIFIED/EXECUTED/FAILED/STUCK`
 - canonical id 生成策略：
-  - LayerZero 優先 `lz:{srcEid}:{sender}:{nonce}`，若欄位不足才回退 `lz:{guid}`
+  - LayerZero 優先 `lz:{srcEid}:{sender}:{nonce}`，其次 `lz:{guid}`
   - Wormhole 使用 `wormhole:{emitterChainId}:{emitterAddress}:{sequence}`
   - 若解碼不足則回退 `protocol:chain_id:tx_hash:log_index`
 - 僅將 `Ethereum + TARGET_CHAIN` 雙邊交易寫入 `xchain_txs`，單邊或非目標鏈對事件不會進入主表。
+- `eth_getLogs` 的返回不包含區塊 timestamp，因此不額外調 block RPC 時，`src_timestamp/event_ts` 通常為空。
+- `latest` 會按 Ethereum 主網側最早事件的 `(block_number, log_index)` 倒序排序。
+- 若 reorg 或方向校驗後交易失去有效雙邊證據，會清理對應：
+  - `xchain_txs`
+  - `xchain_timeline_events`
+  - `search_index`
+  - `risk_reports`
+- `STUCK` 判定基準使用主交易最近一次更新時間，而非初次建立時間
 
 ### `risk/service.py`
-- 規則引擎優先，AI 為可選補充
+- 規則引擎提供基線觀察與回退
+- 內建待檢查池與背景 worker，避免阻塞 indexer 主循環
+- 若配置 AI，會按批量方式評審多筆交易
+- 默認 provider 配置對齊智譜 OpenAI-compatible 接口
+- 默認模型為免費的 `glm-4.7-flash`
 - 主要輸出：
   - `verdict`（`SAFE/WARNING/HIGH_RISK/UNKNOWN`）
-  - `risk_score`（0-100）
+  - `risk_score`（0-100，越高越安全）
   - `risk_factors_json`、`analysis_summary`
+- 模型輸出要求：
+  - 按 `TX-1 ... TX-N` 分段
+  - 每段必須包含 `canonical_id`
+  - 逐筆解析，單筆失敗單筆回退
+
+`/api/health` 額外提供 `risk` 狀態：
+- `running`
+- `pendingCount`
+- `lastError`
+- `lastEnqueuedIds`
+- `lastCompletedIds`
 
 ### `api/routes.py`
 - `GET /api/latest`
+- `GET /api/latest?category=executed|in_progress|attention`
 - `GET /api/search`
 - `GET /api/tx/{canonicalId}`
 - `GET /api/stream`（SSE；每次 indexer cycle 完成後推送 `items + insertedCanonicalIds`）
+- `GET /api/stream?category=executed|in_progress|attention`
 - API model 由 `api/schemas.py` 管理
+- `latest/stream` 目前按 Ethereum 主網側 `(block_number, log_index)` 倒序排序
+- `category` 過濾口徑：
+  - `total` 或空值：不過濾
+  - `executed`：`status = EXECUTED`
+  - `in_progress`：`status in (SENT, VERIFIED)`
+  - `attention`：`status in (FAILED, STUCK)`
+- `GET /api/search` 目前實際可穩定命中的 key 為：
+  - `canonicalId`
+  - `txHash`
+- address 搜索尚未建立對應索引
 
 `/api/stream` 事件格式（`StreamLatestEvent`）：
 - `event`：固定 `indexer_cycle`

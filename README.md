@@ -57,14 +57,30 @@ npm run dev
 - `LAYERZERO_*_TOPICS`
 - `WORMHOLE_SENT_TOPICS`
 - `WORMHOLE_EXECUTED_TOPICS`
+- `LAYERZERO_*_ENDPOINTS`
+- `WORMHOLE_*_CORE_CONTRACTS`
+- `WORMHOLE_*_TOKEN_BRIDGES`
 
 說明：
 - `TARGET_CHAIN_ID` 不再需要手動配置，系統會從 `TARGET_CHAIN_RPC_URL` 呼叫 `eth_chainId` 自動取得。
+- `.env.example` 內的協議地址示例只適用於 `Ethereum <-> Arbitrum` 主網組合；如果更換 `TARGET_CHAIN`，必須同步替換相關合約地址。
 
 可選：
 - `AI_API_KEY`
 - `AI_BASE_URL`
 - `AI_MODEL`
+- `AI_BATCH_SIZE`
+- `AI_BATCH_MAX_SIZE`
+- `AI_MAX_PROMPT_CHARS`
+- `AI_MAX_OUTPUT_TOKENS`
+- `AI_TEMPERATURE`
+
+AI 默認配置：
+- 默認走智譜 OpenAI-compatible 接口
+- 默認模型：`glm-4.7-flash`
+- 默認批量分析：`5` 筆 / 批，最大 `10` 筆 / 批
+- AI 評審由背景異步 worker 從待檢查池中批量取交易執行
+- AI 分數為 `0-100`，分數越高表示越安全，分數越低表示風險越高
 
 Topic 參考：
 - `src/backend/docs/protocol_topics.md`
@@ -73,4 +89,17 @@ Topic 參考：
 ## 已知限制（MVP）
 - canonical id 目前採 fallback 策略（`chain_id + tx_hash + log_index`）。
 - address 搜索需要鏈上可觀測資料，目前僅建立 canonicalId/txHash 索引。
-- `event_ts` 與 latency 分解尚未接入完整鏈上時間戳解析。
+- 目前僅使用 `eth_getLogs`，log 本身不含區塊 timestamp，因此 `event_ts` 不可直接由 log 得出。
+- AI 風險評審目前是單進程背景 worker，尚未接入外部消息隊列。
+
+## Dashboard 篩選
+- Dashboard 的 `Total / Executed / In Progress / Need Attention` 統計卡可點擊。
+- 點擊後前端會顯示該類別對應的 top 50 交易。
+- 後端對應接口：
+  - `GET /api/latest?category=executed|in_progress|attention`
+  - `GET /api/stream?category=executed|in_progress|attention`
+- 類別口徑：
+  - `Total`：全部交易
+  - `Executed`：`status = EXECUTED`
+  - `In Progress`：`status in (SENT, VERIFIED)`
+  - `Need Attention`：`status in (FAILED, STUCK)`

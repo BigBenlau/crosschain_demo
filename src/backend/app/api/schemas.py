@@ -58,6 +58,15 @@ class LatestResponse(BaseModel):
     nextCursor: str | None
 
 
+class GlobalStatsResponse(BaseModel):
+    """全局統計 API 回應模型。"""
+
+    total: int
+    executed: int
+    riskPending: int
+    attention: int
+
+
 class XChainTxDetail(BaseModel):
     """交易詳情 API 回應模型。"""
 

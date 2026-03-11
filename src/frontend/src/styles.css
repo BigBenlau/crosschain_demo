@@ -145,6 +145,8 @@ button.ghost {
   background: linear-gradient(180deg, rgba(20, 30, 63, 0.9) 0%, rgba(11, 19, 42, 0.86) 100%);
   border-radius: 14px;
   padding: 14px;
+  width: 100%;
+  text-align: left;
 }
 
 .stat-card span {
@@ -157,6 +159,16 @@ button.ghost {
   margin-top: 7px;
   font-size: 24px;
   color: #f0f4ff;
+}
+
+.stat-card:hover {
+  border-color: rgba(131, 166, 255, 0.45);
+  background: linear-gradient(180deg, rgba(28, 40, 82, 0.96) 0%, rgba(14, 24, 52, 0.92) 100%);
+}
+
+.stat-card.is-active {
+  border-color: rgba(93, 145, 255, 0.82);
+  box-shadow: 0 0 0 1px rgba(93, 145, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
 .layout {

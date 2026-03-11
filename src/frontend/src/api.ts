@@ -1,12 +1,26 @@
-import type { TxDetail, XChainTxSummary } from "./types";
+import type { GlobalStats, TxDetail, XChainTxSummary } from "./types";
 
-export async function fetchLatest(): Promise<XChainTxSummary[]> {
-  const resp = await fetch("/api/latest?limit=50");
+export type LatestCategory = "total" | "executed" | "in_progress" | "attention";
+
+export async function fetchLatest(category: LatestCategory = "total"): Promise<XChainTxSummary[]> {
+  const params = new URLSearchParams({ limit: "50" });
+  if (category !== "total") {
+    params.set("category", category);
+  }
+  const resp = await fetch(`/api/latest?${params.toString()}`);
   if (!resp.ok) {
     throw new Error(`latest request failed: ${resp.status}`);
   }
   const data = await resp.json();
   return data.items ?? [];
+}
+
+export async function fetchGlobalStats(): Promise<GlobalStats> {
+  const resp = await fetch("/api/stats");
+  if (!resp.ok) {
+    throw new Error(`stats request failed: ${resp.status}`);
+  }
+  return resp.json();
 }
 
 export async function fetchTx(canonicalId: string): Promise<TxDetail> {

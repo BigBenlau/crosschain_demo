@@ -11,11 +11,11 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import RawLog, SearchIndex, XChainTimelineEvent, XChainTx
+from app.models import RawLog, RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
 from app.registry import get_protocol_registry
 
 
@@ -30,13 +30,22 @@ class NormalizerService:
 
     def normalize_all(self, db: Session, dual_chain_pair: tuple[int, int] | None = None) -> list[str]:
         """執行全量正規化，回傳本輪變更的 canonical id 列表。"""
+        # 階段 0：前置條件。
+        # 僅在已解析出雙邊鏈配對（Ethereum + TARGET_CHAIN）時執行正規化；
+        # 若缺少配對資訊，直接返回空集合，避免誤寫入單邊交易。
         if dual_chain_pair is None:
             return []
 
+        # 階段 1：初始化本輪上下文。
+        # - protocol_maps：topic0 -> stage 的快速映射
+        # - changed_ids：收集本輪有更新的 canonical id
+        # - seen_search_keys：同一輪內 search_index 去重
         protocol_maps = {item.key: item.stage_by_topic for item in get_protocol_registry(settings)}
         changed_ids: set[str] = set()
         seen_search_keys: set[tuple[str, str, str]] = set()
 
+        # 階段 2：掃描所有有效 raw logs，先整理為「可用事件」清單。
+        # 這一階段只做解析與歸類，不直接寫 xchain_txs，便於後續先做雙邊過濾。
         stmt = select(RawLog).where(RawLog.removed.is_(False)).order_by(RawLog.block_number.asc(), RawLog.id.asc())
         logs = db.execute(stmt).scalars().all()
         staged_entries: list[tuple[RawLog, str, str, dict[str, Any] | None]] = []
@@ -48,10 +57,21 @@ class NormalizerService:
             staged_entries.append(entry)
             self._accumulate_chain_sides(chain_sides, entry[2], raw, entry[1], dual_chain_pair, entry[3])
 
+        # 階段 3：計算符合雙邊條件的 canonical id（縮小處理場景）。
+        # 只保留：
+        # - 同一 canonical id 同時出現 src/dst
+        # - 方向可校驗且無衝突
+        # - 鏈對為 Ethereum <-> TARGET_CHAIN
         eligible_ids = self._eligible_canonical_ids(chain_sides, dual_chain_pair)
+        changed_ids.update(self._prune_ineligible_transactions(db, eligible_ids))
         if not eligible_ids:
-            return []
+            changed_stuck = self._mark_stuck_transactions(db)
+            changed_ids.update(changed_stuck)
+            db.commit()
+            return list(changed_ids)
 
+        # 階段 4：僅針對 eligible canonical id 寫主表、時間線、搜索索引。
+        # 這是核心收斂步驟，避免單邊或錯向資料進入 xchain_txs。
         for raw, stage, canonical_id, _decoded in staged_entries:
             if canonical_id not in eligible_ids:
                 continue
@@ -67,6 +87,9 @@ class NormalizerService:
             if changed:
                 changed_ids.add(canonical_id)
 
+        # 階段 5：收尾規則與提交。
+        # 補標記超時未推進交易為 STUCK，再統一 commit。
+        db.flush()
         changed_stuck = self._mark_stuck_transactions(db)
         changed_ids.update(changed_stuck)
         db.commit()
@@ -309,12 +332,16 @@ class NormalizerService:
     def _apply_stage(self, tx: XChainTx, raw: RawLog, stage: str) -> bool:
         """根據事件階段更新主交易表。"""
         changed = False
+        changed = self._apply_ethereum_order_key(tx, raw) or changed
         if stage == "SENT":
             if tx.src_chain_id is None:
                 tx.src_chain_id = raw.chain_id
                 changed = True
             if tx.src_tx_hash is None:
                 tx.src_tx_hash = raw.tx_hash
+                changed = True
+            if raw.block_timestamp is not None and (tx.src_timestamp is None or raw.block_timestamp < tx.src_timestamp):
+                tx.src_timestamp = raw.block_timestamp
                 changed = True
         if stage in {"VERIFIED", "EXECUTED", "FAILED"}:
             if tx.dst_chain_id is None:
@@ -323,25 +350,62 @@ class NormalizerService:
             if tx.dst_tx_hash is None:
                 tx.dst_tx_hash = raw.tx_hash
                 changed = True
+            if raw.block_timestamp is not None and (tx.dst_timestamp is None or raw.block_timestamp < tx.dst_timestamp):
+                tx.dst_timestamp = raw.block_timestamp
+                changed = True
 
         new_status = self._merge_status(tx.status, stage)
         if new_status != tx.status:
             tx.status = new_status
             changed = True
 
-        if stage == "FAILED" and tx.failure_category != "FAILED_DEST_EXECUTION":
-            tx.failure_category = "FAILED_DEST_EXECUTION"
+        new_failure_category = self._failure_category_for_stage(stage)
+        if tx.failure_category != new_failure_category:
+            tx.failure_category = new_failure_category
             changed = True
 
         return changed
+
+    def _apply_ethereum_order_key(self, tx: XChainTx, raw: RawLog) -> bool:
+        """保存 Ethereum 主網側最早事件的位置，供 latest 排序使用。"""
+        if raw.chain_id != 1:
+            return False
+
+        current_block = tx.ethereum_block_number
+        current_log_index = tx.ethereum_log_index
+        if current_block is None:
+            tx.ethereum_block_number = raw.block_number
+            tx.ethereum_log_index = raw.log_index
+            return True
+
+        if raw.block_number < current_block:
+            tx.ethereum_block_number = raw.block_number
+            tx.ethereum_log_index = raw.log_index
+            return True
+
+        if raw.block_number == current_block and current_log_index is not None and raw.log_index < current_log_index:
+            tx.ethereum_log_index = raw.log_index
+            return True
+
+        if raw.block_number == current_block and current_log_index is None:
+            tx.ethereum_log_index = raw.log_index
+            return True
+
+        return False
 
     def _merge_status(self, current: str, incoming: str) -> str:
         """合併原狀態與新事件狀態。"""
         if current == "FAILED" or incoming == "FAILED":
             return "FAILED"
-        if current == "STUCK":
+        if current == "STUCK" and incoming == "STUCK":
             return "STUCK"
         return incoming if _status_rank(incoming) >= _status_rank(current) else current
+
+    def _failure_category_for_stage(self, stage: str) -> str | None:
+        """根據最新狀態清理或設置 failure category。"""
+        if stage == "FAILED":
+            return "FAILED_DEST_EXECUTION"
+        return None
 
     def _upsert_timeline(self, db: Session, raw: RawLog, canonical_id: str, stage: str) -> bool:
         """插入時間線事件（若已存在則跳過）。"""
@@ -356,7 +420,11 @@ class NormalizerService:
         )
         existing = db.execute(stmt).scalar_one_or_none()
         if existing:
-            return False
+            changed = False
+            if existing.event_ts is None and raw.block_timestamp is not None:
+                existing.event_ts = raw.block_timestamp
+                changed = True
+            return changed
 
         db.add(
             XChainTimelineEvent(
@@ -367,7 +435,7 @@ class NormalizerService:
                 block_number=raw.block_number,
                 log_index=raw.log_index,
                 event_name=f"{raw.protocol}:{stage.lower()}",
-                event_ts=None,
+                event_ts=raw.block_timestamp,
                 evidence_json=raw.data,
             )
         )
@@ -427,17 +495,34 @@ class NormalizerService:
         stmt = select(XChainTx).where(
             and_(
                 XChainTx.status.in_(["SENT", "VERIFIED"]),
-                XChainTx.created_at <= threshold,
+                or_(XChainTx.updated_at <= threshold, XChainTx.created_at <= threshold),
             )
         )
         rows = db.execute(stmt).scalars().all()
         changed: list[str] = []
         for tx in rows:
             prev_status = tx.status
+            if prev_status == "STUCK":
+                continue
             tx.status = "STUCK"
             tx.failure_category = "STUCK_NO_VERIFY" if prev_status == "SENT" else "STUCK_NEED_EXECUTION"
             changed.append(tx.canonical_id)
         return changed
+
+    def _prune_ineligible_transactions(self, db: Session, eligible_ids: set[str]) -> list[str]:
+        """刪除已失去有效鏈上證據的交易及其關聯資料。"""
+        stmt = select(XChainTx.canonical_id)
+        if eligible_ids:
+            stmt = stmt.where(XChainTx.canonical_id.not_in(eligible_ids))
+        existing_ids = [row[0] for row in db.execute(stmt).all()]
+        if not existing_ids:
+            return []
+
+        db.execute(delete(RiskReport).where(RiskReport.canonical_id.in_(existing_ids)))
+        db.execute(delete(XChainTimelineEvent).where(XChainTimelineEvent.canonical_id.in_(existing_ids)))
+        db.execute(delete(SearchIndex).where(SearchIndex.canonical_id.in_(existing_ids)))
+        db.execute(delete(XChainTx).where(XChainTx.canonical_id.in_(existing_ids)))
+        return existing_ids
 
 
 normalizer_service = NormalizerService()
