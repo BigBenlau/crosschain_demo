@@ -13,8 +13,8 @@
 ## Backend 啟動
 ```bash
 cd src/backend
-cp .env.example .env
-# 填入 ETH_RPC_URL、TARGET_CHAIN、TARGET_CHAIN_RPC_URL 等配置
+python scripts/gen_env_from_sample.py --force
+# 按提示填入必填配置
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -22,12 +22,14 @@ uvicorn app.main:app --reload
 ## 由範本生成 `.env`
 ```bash
 cd src/backend
-python scripts/env_from_sample.py --force
+python scripts/gen_env_from_sample.py --force
 ```
+
+腳本會互動式詢問必填項，直接按 Enter 可接受模板中的默認值。
 
 可帶覆寫參數：
 ```bash
-python scripts/env_from_sample.py --force \
+python scripts/gen_env_from_sample.py --force \
   --set API_KEY=your_key \
   --set ETH_RPC_URL=https://rpc.ankr.com/eth/your_key \
   --set TARGET_CHAIN_RPC_URL=https://rpc.ankr.com/arbitrum/your_key
