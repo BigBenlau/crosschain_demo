@@ -41,6 +41,7 @@ def health() -> dict:
         "api": "ok",
         "env": settings.app_env,
         "targetChain": settings.target_chain,
+        "targetChainExplorerBaseUrl": settings.target_chain_explorer_base_url,
         "rpcConfigured": bool(settings.eth_rpc_url and settings.target_chain_rpc_url),
         "configuredStartBlock": {
             "ethereum": settings.eth_start_block,

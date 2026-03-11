@@ -63,6 +63,7 @@ class XChainTimelineEvent(Base):
     event_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decoded_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class RawLog(Base):

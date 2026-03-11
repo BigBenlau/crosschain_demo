@@ -44,6 +44,10 @@ def _ensure_schema_compat() -> None:
         if "block_timestamp" not in raw_log_columns:
             conn.execute(text("ALTER TABLE raw_logs ADD COLUMN block_timestamp DATETIME"))
 
+        timeline_columns = _column_names("xchain_timeline_events")
+        if "decoded_json" not in timeline_columns:
+            conn.execute(text("ALTER TABLE xchain_timeline_events ADD COLUMN decoded_json TEXT"))
+
         xchain_txs_indexes = _index_names("xchain_txs")
         if "ix_xchain_txs_src_timestamp" not in xchain_txs_indexes:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_src_timestamp ON xchain_txs (src_timestamp)"))

@@ -1,11 +1,18 @@
 import type { GlobalStats, TxDetail, XChainTxSummary } from "./types";
 
 export type LatestCategory = "total" | "executed" | "in_progress" | "attention";
+export type ProtocolFilter = "all" | "layerzero" | "wormhole";
 
-export async function fetchLatest(category: LatestCategory = "total"): Promise<XChainTxSummary[]> {
+export async function fetchLatest(
+  category: LatestCategory = "total",
+  protocol: ProtocolFilter = "all",
+): Promise<XChainTxSummary[]> {
   const params = new URLSearchParams({ limit: "50" });
   if (category !== "total") {
     params.set("category", category);
+  }
+  if (protocol !== "all") {
+    params.set("protocol", protocol);
   }
   const resp = await fetch(`/api/latest?${params.toString()}`);
   if (!resp.ok) {

@@ -51,6 +51,7 @@ npm run dev
 - `ETH_RPC_URL`
 - `TARGET_CHAIN`
 - `TARGET_CHAIN_RPC_URL`
+- `TARGET_CHAIN_EXPLORER_BASE_URL`
 - `ETH_START_BLOCK`
 - `TARGET_CHAIN_START_BLOCK`
 - `INDEXER_POLL_SECONDS=15`
@@ -63,6 +64,7 @@ npm run dev
 
 說明：
 - `TARGET_CHAIN_ID` 不再需要手動配置，系統會從 `TARGET_CHAIN_RPC_URL` 呼叫 `eth_chainId` 自動取得。
+- `TARGET_CHAIN_EXPLORER_BASE_URL` 用於前端 tx detail 跳轉目標鏈 explorer，鏈接格式固定為 `/tx/{tx_hash}#eventlog`。
 - `.env.example` 內的協議地址示例只適用於 `Ethereum <-> Arbitrum` 主網組合；如果更換 `TARGET_CHAIN`，必須同步替換相關合約地址。
 
 可選：
@@ -94,12 +96,22 @@ Topic 參考：
 
 ## Dashboard 篩選
 - Dashboard 的 `Total / Executed / In Progress / Need Attention` 統計卡可點擊。
+- 每張統計卡除了總數，也會顯示 `LayerZero / Wormhole` 各自的數量拆分。
 - 點擊後前端會顯示該類別對應的 top 50 交易。
+- Dashboard 另提供協議篩選標簽，可切換：
+  - `All`
+  - `LayerZero`
+  - `Wormhole`
 - 後端對應接口：
-  - `GET /api/latest?category=executed|in_progress|attention`
-  - `GET /api/stream?category=executed|in_progress|attention`
+  - `GET /api/stats`
+  - `GET /api/latest?category=executed|in_progress|attention&protocol=layerzero|wormhole`
+  - `GET /api/stream?category=executed|in_progress|attention&protocol=layerzero|wormhole`
 - 類別口徑：
   - `Total`：全部交易
   - `Executed`：`status = EXECUTED`
   - `In Progress`：`status in (SENT, VERIFIED)`
   - `Need Attention`：`status in (FAILED, STUCK)`
+- `/api/stats` 會同時返回：
+  - 全局總數
+  - `byProtocol.layerzero`
+  - `byProtocol.wormhole`

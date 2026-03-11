@@ -194,10 +194,16 @@ class NormalizerService:
         dual_chain_pair: tuple[int, int],
         decoded: dict[str, Any] | None,
     ) -> None:
-        """累積每個 canonical_id 的 src/dst 鏈資訊。"""
+        """累積每個 canonical_id 的方向與雙邊鏈上證據資訊。"""
         sides = chain_sides.get(canonical_id)
         if sides is None:
-            sides = {"src": None, "dst": None, "conflict": False}
+            sides = {
+                "src": None,
+                "dst": None,
+                "conflict": False,
+                "has_src_evidence": False,
+                "has_dst_evidence": False,
+            }
             chain_sides[canonical_id] = sides
 
         direction = self._resolve_direction(raw, stage, dual_chain_pair, decoded)
@@ -215,16 +221,23 @@ class NormalizerService:
         elif sides["dst"] != dst_chain_id:
             sides["conflict"] = True
 
+        if stage == "SENT" and raw.chain_id == src_chain_id:
+            sides["has_src_evidence"] = True
+        if stage in {"VERIFIED", "EXECUTED", "FAILED"} and raw.chain_id == dst_chain_id:
+            sides["has_dst_evidence"] = True
+
     def _eligible_canonical_ids(
         self,
         chain_sides: dict[str, dict[str, int | bool | None]],
         dual_chain_pair: tuple[int, int],
     ) -> set[str]:
-        """計算符合 Ethereum + TARGET_CHAIN 雙邊配對的 canonical id 集合。"""
+        """計算符合 Ethereum + TARGET_CHAIN 且具備雙邊鏈上證據的 canonical id 集合。"""
         eth_chain_id, target_chain_id = dual_chain_pair
         output: set[str] = set()
         for canonical_id, sides in chain_sides.items():
             if bool(sides.get("conflict")):
+                continue
+            if not bool(sides.get("has_src_evidence")) or not bool(sides.get("has_dst_evidence")):
                 continue
             src = sides.get("src")
             dst = sides.get("dst")
@@ -424,6 +437,12 @@ class NormalizerService:
             if existing.event_ts is None and raw.block_timestamp is not None:
                 existing.event_ts = raw.block_timestamp
                 changed = True
+            if existing.evidence_json != raw.data:
+                existing.evidence_json = raw.data
+                changed = True
+            if existing.decoded_json != raw.decoded_json:
+                existing.decoded_json = raw.decoded_json
+                changed = True
             return changed
 
         db.add(
@@ -437,6 +456,7 @@ class NormalizerService:
                 event_name=f"{raw.protocol}:{stage.lower()}",
                 event_ts=raw.block_timestamp,
                 evidence_json=raw.data,
+                decoded_json=raw.decoded_json,
             )
         )
         return True

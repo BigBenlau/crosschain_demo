@@ -50,11 +50,17 @@
   - 默認對接智譜免費模型 `GLM-4.7-Flash`
   - 風險分數範圍 `0-100`，越高越安全
 - `src/backend/app/api/routes.py`
-  - 提供 `latest/search/detail/stream`
+  - 提供 `latest/search/detail/stream/stats`
+  - `stats` 會返回全局統計與 `LayerZero / Wormhole` 拆分統計
+  - `detail` 會返回 timeline 與 decode 明細
 
 ### 前端
 - `src/frontend/src/App.tsx`
   - 包含 Dashboard 與 Tx Detail 路由頁
+  - Dashboard 的統計卡會同時展示總數與 `LayerZero / Wormhole` 拆分數
+  - Dashboard 支援協議標簽切換 latest top 50：`All / LayerZero / Wormhole`
+  - Tx Detail 的 from/to/timeline `tx_hash` 可跳轉對應 explorer event log 頁
+  - Tx Detail 會展示每個事件的 raw data 與 decoded JSON
 - `src/frontend/src/api.ts`
   - 封裝 `fetchLatest / searchTx / fetchTx`
 - `src/frontend/src/types.ts`

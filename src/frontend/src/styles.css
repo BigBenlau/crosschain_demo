@@ -161,6 +161,31 @@ button.ghost {
   color: #f0f4ff;
 }
 
+.stat-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #8ea4d7;
+}
+
+.stat-breakdown-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stat-breakdown-label {
+  color: #8ea4d7;
+}
+
+.stat-breakdown-value {
+  color: #dfe8ff;
+  font-weight: 700;
+}
+
 .stat-card:hover {
   border-color: rgba(131, 166, 255, 0.45);
   background: linear-gradient(180deg, rgba(28, 40, 82, 0.96) 0%, rgba(14, 24, 52, 0.92) 100%);
@@ -216,6 +241,37 @@ button.ghost {
   align-items: center;
   gap: 12px;
   margin-bottom: 10px;
+}
+
+.panel-title-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.panel-subtitle {
+  margin: 0;
+  color: #8ea4d7;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.protocol-filters {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.protocol-filter {
+  padding: 8px 12px;
+}
+
+.protocol-filter.is-active {
+  border-color: rgba(93, 145, 255, 0.82);
+  background: rgba(30, 44, 92, 0.72);
+  color: #f3f6ff;
 }
 
 .panel h2 {
@@ -326,6 +382,39 @@ button.ghost {
   margin: 0 0 6px;
 }
 
+.decode-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.decode-card {
+  border: 1px solid rgba(173, 189, 234, 0.18);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(8, 16, 36, 0.45);
+}
+
+.decode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.decode-window {
+  margin: 6px 0 0;
+  border: 1px solid rgba(173, 189, 234, 0.2);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(8, 16, 36, 0.5);
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: #d6e3ff;
+  max-height: 320px;
+  overflow: auto;
+}
+
 .analysis-window {
   border: 1px solid rgba(173, 189, 234, 0.2);
   border-radius: 12px;
@@ -418,6 +507,16 @@ button.ghost {
   word-break: break-all;
 }
 
+.tx-link {
+  color: #9fc5ff;
+  text-decoration: none;
+}
+
+.tx-link:hover {
+  color: #c7ddff;
+  text-decoration: underline;
+}
+
 .muted {
   color: #91a5cf;
   font-size: 13px;
@@ -481,6 +580,10 @@ button.ghost {
   }
 
   .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .decode-grid {
     grid-template-columns: 1fr;
   }
 }

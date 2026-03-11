@@ -63,6 +63,7 @@
   - core contracts
   - token bridge contracts
 - Wormhole 的 sender filter 僅用於 `SENT` 事件額外過濾非 bridge sender
+- 若 Wormhole 的 `emitter_chain_id` / `src_wormhole_chain_id` / `dst_wormhole_chain_id` 不屬於 `Ethereum + TARGET_CHAIN`，會在 indexer 階段直接跳過，不寫入資料庫
 
 ### `indexer/service.py`
 - 負責鏈上讀取，嚴格不使用協議 offchain 資料源
@@ -91,6 +92,7 @@
 - 僅將 `Ethereum + TARGET_CHAIN` 雙邊交易寫入 `xchain_txs`，單邊或非目標鏈對事件不會進入主表。
 - `eth_getLogs` 的返回不包含區塊 timestamp，因此不額外調 block RPC 時，`src_timestamp/event_ts` 通常為空。
 - `latest` 會按 Ethereum 主網側最早事件的 `(block_number, log_index)` 倒序排序。
+- 會將 `raw_logs.data` 與 `raw_logs.decoded_json` 同步到 `xchain_timeline_events`，供 detail 頁展示 decode 結果。
 - 若 reorg 或方向校驗後交易失去有效雙邊證據，會清理對應：
   - `xchain_txs`
   - `xchain_timeline_events`
@@ -122,18 +124,26 @@
 
 ### `api/routes.py`
 - `GET /api/latest`
-- `GET /api/latest?category=executed|in_progress|attention`
+- `GET /api/latest?category=executed|in_progress|attention&protocol=layerzero|wormhole`
+- `GET /api/stats`
 - `GET /api/search`
 - `GET /api/tx/{canonicalId}`
 - `GET /api/stream`（SSE；每次 indexer cycle 完成後推送 `items + insertedCanonicalIds`）
-- `GET /api/stream?category=executed|in_progress|attention`
+- `GET /api/stream?category=executed|in_progress|attention&protocol=layerzero|wormhole`
 - API model 由 `api/schemas.py` 管理
+- tx detail 會返回 `decodedLogs`，包含每個事件的 raw data 與 decoded JSON
+- tx detail 的 `timeline/decodedLogs` 會按跨鏈流程順序展示，先發生的事件在上、後發生的事件在下
 - `latest/stream` 目前按 Ethereum 主網側 `(block_number, log_index)` 倒序排序
+- `stats` 會同時返回全局統計與 `byProtocol.layerzero / byProtocol.wormhole`
 - `category` 過濾口徑：
   - `total` 或空值：不過濾
   - `executed`：`status = EXECUTED`
   - `in_progress`：`status in (SENT, VERIFIED)`
   - `attention`：`status in (FAILED, STUCK)`
+- `protocol` 過濾口徑：
+  - 空值或 `all`：不過濾
+  - `layerzero`
+  - `wormhole`
 - `GET /api/search` 目前實際可穩定命中的 key 為：
   - `canonicalId`
   - `txHash`

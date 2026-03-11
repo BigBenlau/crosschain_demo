@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     api_key: str
     eth_rpc_url: str
     target_chain_rpc_url: str
+    target_chain_explorer_base_url: str
 
     # 歷史回填起始區塊配置
     eth_start_block: int

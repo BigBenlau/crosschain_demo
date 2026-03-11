@@ -234,18 +234,40 @@ class RiskService:
 
             if settings.ai_api_key:
                 for batch in self._build_batches(batch_items):
+                    batch_canonical_ids = [item.canonical_id for item in batch]
                     ai_output = self._ai_assessment(batch)
                     if ai_output is None:
+                        logger.warning(
+                            "AI batch parse skipped: batch_size=%s canonical_ids=%s reason=no_ai_output",
+                            len(batch),
+                            batch_canonical_ids,
+                        )
                         continue
                     parsed = self._parse_batch_response(ai_output, batch)
+                    parsed_ids = [item.canonical_id for item in batch if item.canonical_id in parsed]
+                    fallback_ids = [item.canonical_id for item in batch if item.canonical_id not in parsed]
+                    logger.info(
+                        "AI batch parsed: batch_size=%s parsed=%s fallback=%s parsed_ids=%s fallback_ids=%s",
+                        len(batch),
+                        len(parsed_ids),
+                        len(fallback_ids),
+                        parsed_ids,
+                        fallback_ids,
+                    )
                     for item in batch:
                         assessment = parsed.get(item.canonical_id)
                         if assessment is not None:
                             assessments[item.canonical_id] = assessment
 
             completed_ids: list[str] = []
+            ai_applied_ids: list[str] = []
+            rule_fallback_ids: list[str] = []
             for item in batch_items:
                 assessment = assessments[item.canonical_id]
+                if isinstance(assessment, AIAssessment):
+                    ai_applied_ids.append(item.canonical_id)
+                else:
+                    rule_fallback_ids.append(item.canonical_id)
                 self._upsert_report(
                     db,
                     item.canonical_id,
@@ -257,6 +279,14 @@ class RiskService:
                 completed_ids.append(item.canonical_id)
 
             db.commit()
+            logger.info(
+                "Risk reports committed: total=%s ai_applied=%s rule_fallback=%s ai_ids=%s fallback_ids=%s",
+                len(completed_ids),
+                len(ai_applied_ids),
+                len(rule_fallback_ids),
+                ai_applied_ids,
+                rule_fallback_ids,
+            )
             return completed_ids
 
     def _load_timelines(self, db: Session, canonical_ids: list[str]) -> dict[str, list[XChainTimelineEvent]]:
@@ -621,18 +651,20 @@ class RiskService:
         item_by_id: dict[str, BatchItem],
     ) -> tuple[str, AIAssessment] | None:
         """解析單個 `TX-N` 區塊。"""
-        canonical_match = re.search(r"(?m)^canonical_id:\s*(.+?)\s*$", section)
+        normalized_section = self._normalize_section_text(section)
+
+        canonical_match = re.search(r"(?m)^canonical_id:\s*(.+?)\s*$", normalized_section)
         if canonical_match is None:
             return None
         canonical_id = canonical_match.group(1).strip()
         if canonical_id not in item_by_id:
             return None
 
-        verdict_text = self._extract_named_field(section, "結論")
-        score_text = self._extract_named_field(section, "風險分數")
-        risks_body = self._extract_named_block(section, "主要風險")
-        evidence_body = self._extract_named_block(section, "判斷依據")
-        actions_body = self._extract_named_block(section, "建議動作")
+        verdict_text = self._extract_named_field(normalized_section, "結論")
+        score_text = self._extract_named_field(normalized_section, "風險分數")
+        risks_body = self._extract_named_block(normalized_section, "主要風險")
+        evidence_body = self._extract_named_block(normalized_section, "判斷依據")
+        actions_body = self._extract_named_block(normalized_section, "建議動作")
 
         if not verdict_text or not score_text or not risks_body or not evidence_body or not actions_body:
             return None
@@ -649,6 +681,10 @@ class RiskService:
             return None
 
         factors = self._extract_numbered_items(risks_body)
+        if not factors:
+            compact = self._compact_inline_text(risks_body)
+            if compact:
+                factors = [compact]
         if not factors:
             return None
 
@@ -670,6 +706,11 @@ class RiskService:
         if inline_match and inline_match.group(1).strip():
             return inline_match.group(1).strip()
 
+        inline_pattern_loose = rf"(?m)^(?:[-*]\s*)?{re.escape(name)}\s*:\s*(.+?)\s*$"
+        inline_match_loose = re.search(inline_pattern_loose, section)
+        if inline_match_loose and inline_match_loose.group(1).strip():
+            return inline_match_loose.group(1).strip()
+
         block = self._extract_named_block(section, name)
         if block is None:
             return None
@@ -678,13 +719,13 @@ class RiskService:
 
     def _extract_named_block(self, section: str, name: str) -> str | None:
         """提取某個標題下到下一個標題前的文本塊。"""
-        header_pattern = rf"(?m)^{re.escape(name)}:\s*$"
+        header_pattern = rf"(?m)^(?:[-*]\s*)?{re.escape(name)}:\s*$"
         header_match = re.search(header_pattern, section)
         if header_match is None:
-            inline_pattern = rf"(?m)^{re.escape(name)}:\s*(.+?)\s*$"
+            inline_pattern = rf"(?m)^(?:[-*]\s*)?{re.escape(name)}:\s*(.+?)\s*$"
             inline_match = re.search(inline_pattern, section)
             if inline_match is None:
-                return None
+                return self._extract_named_block_by_keyword(section, name)
             return inline_match.group(1).strip()
 
         start = header_match.end()
@@ -692,11 +733,29 @@ class RiskService:
         for candidate in SECTION_HEADERS:
             if candidate == name:
                 continue
-            candidate_match = re.search(rf"(?m)^{re.escape(candidate)}:\s*.*$", section[start:])
+            candidate_match = re.search(rf"(?m)^(?:[-*]\s*)?{re.escape(candidate)}:\s*.*$", section[start:])
             if candidate_match is None:
                 continue
             end = min(end, start + candidate_match.start())
         return section[start:end].strip() or None
+
+    def _extract_named_block_by_keyword(self, section: str, name: str) -> str | None:
+        """在格式較亂時，僅憑關鍵字定位段落文本。"""
+        marker = f"{name}:"
+        start = section.find(marker)
+        if start < 0:
+            return None
+        start += len(marker)
+        end = len(section)
+        for candidate in SECTION_HEADERS:
+            if candidate == name:
+                continue
+            candidate_marker = f"\n{candidate}:"
+            candidate_index = section.find(candidate_marker, start)
+            if candidate_index >= 0:
+                end = min(end, candidate_index)
+        body = section[start:end].strip()
+        return body or None
 
     def _extract_numbered_items(self, body: str) -> list[str]:
         """從 `1. xxx` 形式的文本中提取列表項。"""
@@ -704,11 +763,43 @@ class RiskService:
         for line in body.splitlines():
             match = re.match(r"^\s*\d+\.\s*(.+?)\s*$", line)
             if match is None:
-                continue
-            value = match.group(1).strip()
+                bullet_match = re.match(r"^\s*[-*]\s*(.+?)\s*$", line)
+                if bullet_match is None:
+                    continue
+                value = bullet_match.group(1).strip()
+            else:
+                value = match.group(1).strip()
             if value:
                 output.append(value)
         return output
+
+    def _normalize_section_text(self, text: str) -> str:
+        """標準化模型段落，兼容 markdown 粗體標題與分隔線。"""
+        normalized = text.replace("\r\n", "\n")
+        normalized = re.sub(r"(?m)^\s*\*{3,}\s*$", "", normalized)
+        for header in SECTION_HEADERS:
+            normalized = re.sub(
+                rf"(?m)^\s*\*\*{re.escape(header)}:\*\*\s*(.*?)\s*$",
+                rf"{header}: \1",
+                normalized,
+            )
+            normalized = re.sub(
+                rf"(?m)^\s*\*\*{re.escape(header)}\*\*\s*:\s*(.*?)\s*$",
+                rf"{header}: \1",
+                normalized,
+            )
+            normalized = re.sub(
+                rf"(?m)^\s*\*\*{re.escape(header)}\*\*\s*$",
+                rf"{header}:",
+                normalized,
+            )
+        normalized = re.sub(r"(?m)^\s*-\s*(結論|風險分數|主要風險|判斷依據|建議動作)\s*:\s*", r"\1: ", normalized)
+        return normalized.strip()
+
+    def _compact_inline_text(self, text: str) -> str | None:
+        """將單段文本壓縮成單行，用於非列表式風險點回退。"""
+        compact = " ".join(part.strip() for part in text.splitlines() if part.strip())
+        return compact or None
 
     def _upsert_report(
         self,

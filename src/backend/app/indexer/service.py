@@ -505,11 +505,7 @@ class IndexerService:
             topic0 = topic0_raw.lower() if isinstance(topic0_raw, str) else topic0_raw
             removed = bool(entry.get("removed", False))
 
-            # 2.2 Wormhole SENT 額外過濾：非 TokenBridge sender 直接跳過。
-            if self._should_skip_wormhole_sent_log(protocol_key, topic0, topics, sent_topic_set, sent_sender_filter_set):
-                continue
-
-            # 2.3 協議事件 decode（供 normalizer 生成 canonical 與方向判定）。
+            # 2.2 協議事件 decode（供 normalizer 生成 canonical 與方向判定）。
             decoded_payload = decode_log(
                 protocol=protocol_key,
                 chain_id=chain_id,
@@ -517,6 +513,16 @@ class IndexerService:
                 topics=topics,
                 data_hex=entry.get("data"),
             )
+
+            # 2.3 Wormhole SENT 額外過濾：
+            # 不再硬依賴 sender 白名單，改為要求 decode 後能明確得出允許方向，
+            # 以避免配置的 token bridge 地址誤填時把整批源鏈事件全部丟掉。
+            if self._should_skip_wormhole_sent_log(protocol_key, topic0, decoded_payload, sent_topic_set):
+                continue
+
+            if self._should_skip_wormhole_direction(protocol_key, decoded_payload):
+                continue
+
             decoded_json = json.dumps(decoded_payload, ensure_ascii=False) if decoded_payload else None
 
             # 2.4 基本合法性檢查：缺少定位鍵則無法入庫。
@@ -562,23 +568,49 @@ class IndexerService:
         self,
         protocol_key: str,
         topic0: str | None,
-        topics: list[Any],
+        decoded_payload: dict[str, Any] | None,
         sent_topic_set: set[str],
-        sent_sender_filter_set: set[str],
     ) -> bool:
-        """判斷是否跳過非 TokenBridge sender 的 Wormhole SENT 事件。"""
+        """判斷是否跳過無法確認方向的 Wormhole SENT 事件。"""
         if protocol_key != "wormhole":
             return False
         if topic0 is None or topic0 not in sent_topic_set:
             return False
-        if not sent_sender_filter_set:
+        if not isinstance(decoded_payload, dict):
+            return True
+        direction = decoded_payload.get("direction")
+        if not isinstance(direction, dict):
+            return True
+        dst_chain = direction.get("dst_wormhole_chain_id")
+        if not isinstance(dst_chain, int):
+            return True
+        allowed_chain_ids = {settings.wormhole_ethereum_chain_id, settings.wormhole_target_chain_id}
+        return dst_chain not in allowed_chain_ids
+
+    def _should_skip_wormhole_direction(self, protocol_key: str, decoded_payload: dict[str, Any] | None) -> bool:
+        """跳過非 Ethereum <-> TARGET_CHAIN 的 Wormhole 交易，避免入庫。"""
+        if protocol_key != "wormhole" or not isinstance(decoded_payload, dict):
+            return False
+
+        allowed_chain_ids = {settings.wormhole_ethereum_chain_id, settings.wormhole_target_chain_id}
+        direction = decoded_payload.get("direction")
+        if not isinstance(direction, dict):
+            return False
+
+        dst_chain = direction.get("dst_wormhole_chain_id")
+        if isinstance(dst_chain, int) and dst_chain not in allowed_chain_ids:
             return True
 
-        sender_topic = topics[1] if len(topics) > 1 else None
-        sender_address = _topic_to_address(sender_topic)
-        if sender_address is None:
+        src_chain = direction.get("src_wormhole_chain_id")
+        if isinstance(src_chain, int) and src_chain not in allowed_chain_ids:
             return True
-        return sender_address.lower() not in sent_sender_filter_set
+
+        canonical_hint = decoded_payload.get("canonical_hint")
+        emitter_chain_id = canonical_hint.get("emitter_chain_id") if isinstance(canonical_hint, dict) else None
+        if isinstance(emitter_chain_id, int) and emitter_chain_id not in allowed_chain_ids:
+            return True
+
+        return False
 
 
 indexer_service = IndexerService()

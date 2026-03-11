@@ -2,8 +2,16 @@ import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 
 import { fetchGlobalStats, fetchLatest, fetchTx, searchTx } from "./api";
-import type { LatestCategory } from "./api";
-import type { GlobalStats, RiskReport, StreamLatestEvent, TxDetail, XChainTxSummary } from "./types";
+import type { LatestCategory, ProtocolFilter } from "./api";
+import type {
+  DecodedLogItem,
+  GlobalStats,
+  ProtocolStats,
+  RiskReport,
+  StreamLatestEvent,
+  TxDetail,
+  XChainTxSummary,
+} from "./types";
 
 function shortHash(value: string | null, head = 10, tail = 8): string {
   if (!value) {
@@ -87,17 +95,150 @@ function buildAiReportText(report: RiskReport | null): string {
   return lines.join("\n");
 }
 
+function formatDecodedJson(value: string | null): string {
+  if (!value) {
+    return "無";
+  }
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+}
+
+function buildTxExplorerUrl(txHash: string | null, chainId: number | null, targetChainExplorerBaseUrl: string): string | null {
+  if (!txHash || !chainId) {
+    return null;
+  }
+  const baseUrl = chainId === 1 ? "https://etherscan.io" : targetChainExplorerBaseUrl.trim();
+  if (!baseUrl) {
+    return null;
+  }
+  return `${baseUrl.replace(/\/$/, "")}/tx/${txHash}#eventlog`;
+}
+
+function renderTxHashLink(txHash: string | null, chainId: number | null, targetChainExplorerBaseUrl: string) {
+  const href = buildTxExplorerUrl(txHash, chainId, targetChainExplorerBaseUrl);
+  if (!href || !txHash) {
+    return txHash ?? "-";
+  }
+  return (
+    <a href={href} target="_blank" rel="noreferrer" className="tx-link">
+      {txHash}
+    </a>
+  );
+}
+
 function categoryLabel(category: LatestCategory): string {
   switch (category) {
     case "executed":
-      return "Executed Top 50";
+      return "Executed Latest 50";
     case "in_progress":
-      return "In Progress Top 50";
+      return "In Progress Latest 50";
     case "attention":
-      return "Need Attention Top 50";
+      return "Need Attention Latest 50";
     default:
-      return "Total Top 50";
+      return "Latest 50";
   }
+}
+
+function protocolFilterLabel(protocol: ProtocolFilter): string {
+  switch (protocol) {
+    case "layerzero":
+      return "LayerZero";
+    case "wormhole":
+      return "Wormhole";
+    default:
+      return "All Protocols";
+  }
+}
+
+function protocolStats(stats: GlobalStats, protocol: "layerzero" | "wormhole"): ProtocolStats {
+  return stats.byProtocol[protocol] ?? {
+    total: 0,
+    executed: 0,
+    riskPending: 0,
+    attention: 0,
+  };
+}
+
+function statValueByCategory(stats: ProtocolStats, category: LatestCategory): number {
+  switch (category) {
+    case "executed":
+      return stats.executed;
+    case "in_progress":
+      return stats.riskPending;
+    case "attention":
+      return stats.attention;
+    default:
+      return stats.total;
+  }
+}
+
+function StatCard({
+  title,
+  value,
+  layerzero,
+  wormhole,
+  active,
+  onClick,
+}: {
+  title: string;
+  value: number;
+  layerzero: number;
+  wormhole: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button type="button" className={`stat-card ${active ? "is-active" : ""}`} onClick={onClick}>
+      <span>{title}</span>
+      <strong>{value}</strong>
+      <div className="stat-breakdown">
+        <div className="stat-breakdown-row">
+          <span className="stat-breakdown-label">LayerZero</span>
+          <span className="stat-breakdown-value">{layerzero}</span>
+        </div>
+        <div className="stat-breakdown-row">
+          <span className="stat-breakdown-label">Wormhole</span>
+          <span className="stat-breakdown-value">{wormhole}</span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function DecodedLogCard({
+  item,
+  targetChainExplorerBaseUrl,
+}: {
+  item: DecodedLogItem;
+  targetChainExplorerBaseUrl: string;
+}) {
+  return (
+    <article className="decode-card">
+      <div className="row-top">
+        <span className={`pill ${statusTone(item.stage)}`}>{item.stage}</span>
+        <span className="muted">{item.eventName ?? "Unknown Event"}</span>
+      </div>
+      <p className="muted">
+        {chainLabel(item.chainId)} · block {item.blockNumber ?? "-"} · log {item.logIndex ?? "-"}
+      </p>
+      <p className="mono">
+        Tx: {renderTxHashLink(item.txHash, item.chainId, targetChainExplorerBaseUrl)}
+      </p>
+      <div className="decode-grid">
+        <div>
+          <span className="muted">Raw Data</span>
+          <pre className="decode-window mono">{item.rawData ?? "無"}</pre>
+        </div>
+        <div>
+          <span className="muted">Decoded JSON</span>
+          <pre className="decode-window mono">{formatDecodedJson(item.decodedJson)}</pre>
+        </div>
+      </div>
+    </article>
+  );
 }
 
 function DashboardPage() {
@@ -108,15 +249,21 @@ function DashboardPage() {
     executed: 0,
     riskPending: 0,
     attention: 0,
+    byProtocol: {
+      layerzero: { total: 0, executed: 0, riskPending: 0, attention: 0 },
+      wormhole: { total: 0, executed: 0, riskPending: 0, attention: 0 },
+    },
   });
   const [query, setQuery] = useState("");
   const [errorText, setErrorText] = useState("");
   const [loadingList, setLoadingList] = useState(false);
   const [animatedIds, setAnimatedIds] = useState<string[]>([]);
   const [targetChainName, setTargetChainName] = useState("Target Chain");
+  const [targetChainExplorerBaseUrl, setTargetChainExplorerBaseUrl] = useState("");
   const [ethStartBlock, setEthStartBlock] = useState<number | null>(null);
   const [targetStartBlock, setTargetStartBlock] = useState<number | null>(null);
   const [activeCategory, setActiveCategory] = useState<LatestCategory>("total");
+  const [activeProtocol, setActiveProtocol] = useState<ProtocolFilter>("all");
   const [listMode, setListMode] = useState<"category" | "search">("category");
 
   useEffect(() => {
@@ -149,6 +296,9 @@ function DashboardPage() {
       const params = new URLSearchParams();
       if (activeCategory !== "total") {
         params.set("category", activeCategory);
+      }
+      if (activeProtocol !== "all") {
+        params.set("protocol", activeProtocol);
       }
       const suffix = params.toString();
       source = new EventSource(suffix ? `/api/stream?${suffix}` : "/api/stream");
@@ -184,7 +334,7 @@ function DashboardPage() {
           window.clearTimeout(reconnectTimer);
         }
         reconnectTimer = window.setTimeout(() => {
-          void loadLatest(activeCategory);
+          void loadLatest(activeCategory, activeProtocol);
           connect();
         }, 3000);
       };
@@ -201,14 +351,15 @@ function DashboardPage() {
         window.clearTimeout(timer);
       }
     };
-  }, [activeCategory, listMode]);
+  }, [activeCategory, activeProtocol, listMode]);
 
-  async function loadLatest(category: LatestCategory = activeCategory) {
+  async function loadLatest(category: LatestCategory = activeCategory, protocol: ProtocolFilter = activeProtocol) {
     setLoadingList(true);
     try {
-      const latest = await fetchLatest(category);
+      const latest = await fetchLatest(category, protocol);
       setItems(latest);
       setActiveCategory(category);
+      setActiveProtocol(protocol);
       setListMode("category");
       await loadOverview();
       setErrorText("");
@@ -246,14 +397,17 @@ function DashboardPage() {
       }
       const payload = await response.json();
       const chainKey = typeof payload?.targetChain === "string" ? payload.targetChain : "";
+      const explorerBaseUrl = typeof payload?.targetChainExplorerBaseUrl === "string" ? payload.targetChainExplorerBaseUrl : "";
       const configuredStartBlock = payload?.configuredStartBlock ?? {};
       const ethereumStart = configuredStartBlock?.ethereum;
       const targetChainStart = configuredStartBlock?.targetChain;
       setTargetChainName(chainNameFromKey(chainKey));
+      setTargetChainExplorerBaseUrl(explorerBaseUrl);
       setEthStartBlock(typeof ethereumStart === "number" ? ethereumStart : null);
       setTargetStartBlock(typeof targetChainStart === "number" ? targetChainStart : null);
     } catch {
       setTargetChainName("Target Chain");
+      setTargetChainExplorerBaseUrl("");
       setEthStartBlock(null);
       setTargetStartBlock(null);
     }
@@ -262,7 +416,7 @@ function DashboardPage() {
   async function onSearchSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!query.trim()) {
-      void loadLatest(activeCategory);
+      void loadLatest(activeCategory, activeProtocol);
       return;
     }
     void loadSearchResults(query.trim());
@@ -274,7 +428,12 @@ function DashboardPage() {
 
   function onCategorySelect(category: LatestCategory) {
     setQuery("");
-    void loadLatest(category);
+    void loadLatest(category, activeProtocol);
+  }
+
+  function onProtocolSelect(protocol: ProtocolFilter) {
+    setQuery("");
+    void loadLatest(activeCategory, protocol);
   }
 
   return (
@@ -307,49 +466,79 @@ function DashboardPage() {
       {errorText && <p className="error">{errorText}</p>}
 
       <section className="stats">
-        <button
-          type="button"
-          className={`stat-card ${listMode === "category" && activeCategory === "total" ? "is-active" : ""}`}
+        <StatCard
+          title="Total"
+          value={overview.total}
+          layerzero={protocolStats(overview, "layerzero").total}
+          wormhole={protocolStats(overview, "wormhole").total}
+          active={listMode === "category" && activeCategory === "total"}
           onClick={() => onCategorySelect("total")}
-        >
-          <span>Total</span>
-          <strong>{overview.total}</strong>
-        </button>
-        <button
-          type="button"
-          className={`stat-card ${listMode === "category" && activeCategory === "executed" ? "is-active" : ""}`}
+        />
+        <StatCard
+          title="Executed"
+          value={overview.executed}
+          layerzero={protocolStats(overview, "layerzero").executed}
+          wormhole={protocolStats(overview, "wormhole").executed}
+          active={listMode === "category" && activeCategory === "executed"}
           onClick={() => onCategorySelect("executed")}
-        >
-          <span>Executed</span>
-          <strong>{overview.executed}</strong>
-        </button>
-        <button
-          type="button"
-          className={`stat-card ${listMode === "category" && activeCategory === "in_progress" ? "is-active" : ""}`}
+        />
+        <StatCard
+          title="In Progress"
+          value={overview.riskPending}
+          layerzero={protocolStats(overview, "layerzero").riskPending}
+          wormhole={protocolStats(overview, "wormhole").riskPending}
+          active={listMode === "category" && activeCategory === "in_progress"}
           onClick={() => onCategorySelect("in_progress")}
-        >
-          <span>In Progress</span>
-          <strong>{overview.riskPending}</strong>
-        </button>
-        <button
-          type="button"
-          className={`stat-card ${listMode === "category" && activeCategory === "attention" ? "is-active" : ""}`}
+        />
+        <StatCard
+          title="Need Attention"
+          value={overview.attention}
+          layerzero={protocolStats(overview, "layerzero").attention}
+          wormhole={protocolStats(overview, "wormhole").attention}
+          active={listMode === "category" && activeCategory === "attention"}
           onClick={() => onCategorySelect("attention")}
-        >
-          <span>Need Attention</span>
-          <strong>{overview.attention}</strong>
-        </button>
+        />
       </section>
 
       <main className="dashboard-layout">
         <section className="panel">
           <div className="panel-header">
-            <h2>{listMode === "search" ? "Search Results" : categoryLabel(activeCategory)}</h2>
+            <div className="panel-title-stack">
+              <h2>{listMode === "search" ? "Search Results" : categoryLabel(activeCategory)}</h2>
+              {listMode === "category" ? <p className="panel-subtitle">{protocolFilterLabel(activeProtocol)}</p> : null}
+            </div>
             <button
               className="ghost"
-              onClick={() => (listMode === "search" && query.trim() ? void loadSearchResults(query.trim()) : void loadLatest())}
+              onClick={() =>
+                listMode === "search" && query.trim()
+                  ? void loadSearchResults(query.trim())
+                  : void loadLatest(activeCategory, activeProtocol)
+              }
             >
               {loadingList ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+          <div className="protocol-filters">
+            <button
+              type="button"
+              className={`ghost protocol-filter ${activeProtocol === "all" ? "is-active" : ""}`}
+              onClick={() => onProtocolSelect("all")}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              className={`ghost protocol-filter ${activeProtocol === "layerzero" ? "is-active" : ""}`}
+              onClick={() => onProtocolSelect("layerzero")}
+            >
+              LayerZero
+            </button>
+            <button
+              type="button"
+              className={`ghost protocol-filter ${activeProtocol === "wormhole" ? "is-active" : ""}`}
+              onClick={() => onProtocolSelect("wormhole")}
+            >
+              Wormhole
             </button>
           </div>
           {items.length === 0 ? <p className="empty">暫無資料</p> : null}
@@ -390,6 +579,7 @@ function TxDetailPage() {
   const [detail, setDetail] = useState<TxDetail | null>(null);
   const [errorText, setErrorText] = useState("");
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [targetChainExplorerBaseUrl, setTargetChainExplorerBaseUrl] = useState("");
 
   useEffect(() => {
     if (!canonicalId) {
@@ -398,6 +588,10 @@ function TxDetailPage() {
     }
     void loadDetail(canonicalId);
   }, [canonicalId]);
+
+  useEffect(() => {
+    void loadExplorerMeta();
+  }, []);
 
   async function loadDetail(targetCanonicalId: string) {
     setLoadingDetail(true);
@@ -409,6 +603,21 @@ function TxDetailPage() {
       setErrorText(String(error));
     } finally {
       setLoadingDetail(false);
+    }
+  }
+
+  async function loadExplorerMeta() {
+    try {
+      const response = await fetch("/api/health");
+      if (!response.ok) {
+        return;
+      }
+      const payload = await response.json();
+      const explorerBaseUrl =
+        typeof payload?.targetChainExplorerBaseUrl === "string" ? payload.targetChainExplorerBaseUrl : "";
+      setTargetChainExplorerBaseUrl(explorerBaseUrl);
+    } catch {
+      setTargetChainExplorerBaseUrl("");
     }
   }
 
@@ -460,14 +669,37 @@ function TxDetailPage() {
               </div>
               <div>
                 <span className="muted">From Tx Hash</span>
-                <p className="mono">{detail.tx.srcTxHash ?? "-"}</p>
+                <p className="mono">
+                  {renderTxHashLink(detail.tx.srcTxHash, detail.tx.srcChainId, targetChainExplorerBaseUrl)}
+                </p>
               </div>
               <div>
                 <span className="muted">To Tx Hash</span>
-                <p className="mono">{detail.tx.dstTxHash ?? "-"}</p>
+                <p className="mono">
+                  {renderTxHashLink(detail.tx.dstTxHash, detail.tx.dstChainId, targetChainExplorerBaseUrl)}
+                </p>
               </div>
             </div>
           ) : null}
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h2>Tx Decode</h2>
+          </div>
+          {!detail || detail.decodedLogs.length === 0 ? (
+            <p className="empty">暫無 decode 資料</p>
+          ) : (
+            <div className="decode-list">
+              {detail.decodedLogs.map((item, index) => (
+                <DecodedLogCard
+                  key={`${item.txHash}-${item.logIndex}-${index}`}
+                  item={item}
+                  targetChainExplorerBaseUrl={targetChainExplorerBaseUrl}
+                />
+              ))}
+            </div>
+          )}
         </section>
 
         <section className="panel">
@@ -495,7 +727,9 @@ function TxDetailPage() {
                   </div>
                   <div className="timeline-body">
                     <p>{item.eventName ?? "Unknown Event"}</p>
-                    <p className="mono">Tx: {item.txHash ?? "-"}</p>
+                    <p className="mono">
+                      Tx: {renderTxHashLink(item.txHash, item.chainId, targetChainExplorerBaseUrl)}
+                    </p>
                     <p className="muted">
                       {chainLabel(item.chainId)} · block {item.blockNumber ?? "-"}
                     </p>

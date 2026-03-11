@@ -33,6 +33,19 @@ class TimelineItem(BaseModel):
     evidence: str | None
 
 
+class DecodedLogItem(BaseModel):
+    """交易 decode 區塊模型。"""
+
+    stage: str
+    chainId: int | None
+    txHash: str | None
+    blockNumber: int | None
+    logIndex: int | None
+    eventName: str | None
+    rawData: str | None
+    decodedJson: str | None
+
+
 class RiskReportItem(BaseModel):
     """風險報告輸出模型。"""
 
@@ -58,8 +71,8 @@ class LatestResponse(BaseModel):
     nextCursor: str | None
 
 
-class GlobalStatsResponse(BaseModel):
-    """全局統計 API 回應模型。"""
+class ProtocolStats(BaseModel):
+    """單協議統計輸出模型。"""
 
     total: int
     executed: int
@@ -67,11 +80,29 @@ class GlobalStatsResponse(BaseModel):
     attention: int
 
 
+class ByProtocolStats(BaseModel):
+    """按協議拆分的統計輸出模型。"""
+
+    layerzero: ProtocolStats
+    wormhole: ProtocolStats
+
+
+class GlobalStatsResponse(BaseModel):
+    """全局統計 API 回應模型。"""
+
+    total: int
+    executed: int
+    riskPending: int
+    attention: int
+    byProtocol: ByProtocolStats
+
+
 class XChainTxDetail(BaseModel):
     """交易詳情 API 回應模型。"""
 
     tx: XChainTxSummary
     timeline: list[TimelineItem]
+    decodedLogs: list[DecodedLogItem]
     latency: dict
     failure: str | None
     riskReport: RiskReportItem | None

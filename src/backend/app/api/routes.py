@@ -17,8 +17,11 @@ from sqlalchemy import and_, case, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
+    ByProtocolStats,
+    DecodedLogItem,
     GlobalStatsResponse,
     LatestResponse,
+    ProtocolStats,
     RiskReportItem,
     SearchResponse,
     StreamLatestEvent,
@@ -32,10 +35,28 @@ from app.models import RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
 
 router = APIRouter(prefix="/api", tags=["xchain"])
 
+STAGE_DISPLAY_ORDER = {
+    "SENT": 0,
+    "VERIFIED": 1,
+    "EXECUTED": 2,
+    "FAILED": 2,
+    "STUCK": 3,
+}
+
 
 def _to_iso(value: datetime | None) -> str | None:
     """將 datetime 轉為 ISO 字串。"""
     return value.isoformat() if value else None
+
+
+def _timeline_sort_key(item: XChainTimelineEvent, src_chain_id: int | None) -> tuple[int, int, int, int, int]:
+    """將 timeline/decode 事件排序為由早到晚、由上到下的閱讀順序。"""
+    stage_rank = STAGE_DISPLAY_ORDER.get(item.stage, 99)
+    chain_rank = 0 if src_chain_id is not None and item.chain_id == src_chain_id else 1
+    block_number = int(item.block_number) if item.block_number is not None else 2**63 - 1
+    log_index = int(item.log_index) if item.log_index is not None else 2**31 - 1
+    stable_id = int(item.id) if item.id is not None else 2**31 - 1
+    return (stage_rank, chain_rank, block_number, log_index, stable_id)
 
 
 def _to_summary(tx: XChainTx) -> XChainTxSummary:
@@ -92,8 +113,9 @@ def _build_latest_query(
     """建立 latest 列表查詢。"""
     stmt = select(XChainTx)
     filters = []
-    if protocol:
-        filters.append(XChainTx.protocol == protocol)
+    normalized_protocol = protocol.strip().lower() if protocol else None
+    if normalized_protocol and normalized_protocol != "all":
+        filters.append(XChainTx.protocol == normalized_protocol)
     if status:
         filters.append(XChainTx.status == status)
     if category:
@@ -146,11 +168,38 @@ def global_stats(db: Session = Depends(get_db)) -> GlobalStatsResponse:
         func.sum(case((XChainTx.status.in_(("FAILED", "STUCK")), 1), else_=0)).label("attention"),
     )
     row = db.execute(stmt).one()
+    protocol_stmt = select(
+        XChainTx.protocol.label("protocol"),
+        func.count().label("total"),
+        func.sum(case((XChainTx.status == "EXECUTED", 1), else_=0)).label("executed"),
+        func.sum(case((XChainTx.status.in_(("SENT", "VERIFIED")), 1), else_=0)).label("risk_pending"),
+        func.sum(case((XChainTx.status.in_(("FAILED", "STUCK")), 1), else_=0)).label("attention"),
+    ).group_by(XChainTx.protocol)
+    protocol_rows = db.execute(protocol_stmt).all()
+    by_protocol = {
+        "layerzero": ProtocolStats(total=0, executed=0, riskPending=0, attention=0),
+        "wormhole": ProtocolStats(total=0, executed=0, riskPending=0, attention=0),
+    }
+    for protocol_row in protocol_rows:
+        protocol = str(protocol_row.protocol or "").lower()
+        if protocol not in by_protocol:
+            continue
+        by_protocol[protocol] = ProtocolStats(
+            total=int(protocol_row.total or 0),
+            executed=int(protocol_row.executed or 0),
+            riskPending=int(protocol_row.risk_pending or 0),
+            attention=int(protocol_row.attention or 0),
+        )
+
     return GlobalStatsResponse(
         total=int(row.total or 0),
         executed=int(row.executed or 0),
         riskPending=int(row.risk_pending or 0),
         attention=int(row.attention or 0),
+        byProtocol=ByProtocolStats(
+            layerzero=by_protocol["layerzero"],
+            wormhole=by_protocol["wormhole"],
+        ),
     )
 
 
@@ -199,14 +248,15 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
             dstTxHash=None,
             updatedAt=None,
         )
-        return XChainTxDetail(tx=empty, timeline=[], latency={}, failure=None, riskReport=None)
+        return XChainTxDetail(tx=empty, timeline=[], decodedLogs=[], latency={}, failure=None, riskReport=None)
 
     timeline_stmt = (
         select(XChainTimelineEvent)
         .where(XChainTimelineEvent.canonical_id == canonical_id)
-        .order_by(XChainTimelineEvent.block_number.asc(), XChainTimelineEvent.log_index.asc())
+        .order_by(XChainTimelineEvent.id.asc())
     )
     timeline_rows = db.execute(timeline_stmt).scalars().all()
+    ordered_timeline_rows = sorted(timeline_rows, key=lambda item: _timeline_sort_key(item, tx.src_chain_id))
     timeline = [
         TimelineItem(
             stage=item.stage,
@@ -217,7 +267,21 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
             eventTs=_to_iso(item.event_ts),
             evidence=item.evidence_json,
         )
-        for item in timeline_rows
+        for item in ordered_timeline_rows
+    ]
+    decoded_logs = [
+        DecodedLogItem(
+            stage=item.stage,
+            chainId=item.chain_id,
+            txHash=item.tx_hash,
+            blockNumber=item.block_number,
+            logIndex=item.log_index,
+            eventName=item.event_name,
+            rawData=item.evidence_json,
+            decodedJson=item.decoded_json,
+        )
+        for item in ordered_timeline_rows
+        if item.evidence_json or item.decoded_json
     ]
 
     risk_stmt = (
@@ -235,20 +299,21 @@ def tx_detail(canonical_id: str, db: Session = Depends(get_db)) -> XChainTxDetai
     return XChainTxDetail(
         tx=_to_summary(tx),
         timeline=timeline,
+        decodedLogs=decoded_logs,
         latency=latency,
         failure=tx.failure_category,
         riskReport=_to_risk_report(risk_row),
     )
 
 
-async def _stream_generator(category: str | None) -> AsyncIterator[bytes]:
+async def _stream_generator(category: str | None, protocol: str | None) -> AsyncIterator[bytes]:
     """SSE 生成器：按 indexer cycle 推送最新列表與增量 canonical id。"""
     last_cycle_seq = -1
     while True:
         snapshot = indexer_service.snapshot()
         if snapshot.last_cycle_seq != last_cycle_seq:
             with SessionLocal() as db:
-                stmt = _build_latest_query(None, None, None, None, category).limit(50)
+                stmt = _build_latest_query(protocol, None, None, None, category).limit(50)
                 rows = db.execute(stmt).scalars().all()
                 items = [_to_summary(row) for row in rows]
                 available_ids = {item.canonicalId for item in items}
@@ -267,6 +332,9 @@ async def _stream_generator(category: str | None) -> AsyncIterator[bytes]:
 
 
 @router.get("/stream")
-async def stream(category: str | None = Query(default=None)) -> StreamingResponse:
+async def stream(
+    category: str | None = Query(default=None),
+    protocol: str | None = Query(default=None),
+) -> StreamingResponse:
     """SSE 實時推送端點。"""
-    return StreamingResponse(_stream_generator(category), media_type="text/event-stream")
+    return StreamingResponse(_stream_generator(category, protocol), media_type="text/event-stream")

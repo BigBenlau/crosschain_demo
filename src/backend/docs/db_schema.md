@@ -65,6 +65,7 @@
 | `event_name` | `String(64)` | 是 | - | 原始事件名。 |
 | `event_ts` | `DateTime(timezone=True)` | 是 | - | 事件時間；僅當系統額外取得區塊 timestamp 時可回填。 |
 | `evidence_json` | `Text` | 是 | - | 事件證據（JSON 字串）。 |
+| `decoded_json` | `Text` | 是 | - | 該事件對應的 decode JSON（來自 `raw_logs.decoded_json`）。 |
 
 ## `raw_logs`
 用途：保存從 RPC 抓取的原始鏈上 logs。
