@@ -1,0 +1,31 @@
+services:
+  backend:
+    build:
+      context: ./src/backend
+    container_name: xchain-backend
+    restart: unless-stopped
+    env_file:
+      - ./src/backend/.env
+    environment:
+      DB_PATH: sqlite:////data/xchain_demo.db
+    volumes:
+      - backend-data:/data
+      - backend-logs:/app/logs
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./src/frontend
+    container_name: xchain-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      API_UPSTREAM: http://backend:8000
+    ports:
+      - "80:80"
+
+volumes:
+  backend-data:
+  backend-logs:

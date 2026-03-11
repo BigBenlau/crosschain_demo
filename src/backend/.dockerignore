@@ -1,0 +1,11 @@
+.env
+.env_old
+__pycache__
+*.pyc
+logs
+data_sample
+*.db
+*.sqlite
+venv
+.venv
+db_looker.ipynb
