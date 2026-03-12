@@ -96,6 +96,11 @@ Topic 參考：
 - 目前僅使用 `eth_getLogs`，log 本身不含區塊 timestamp，因此 `event_ts` 不可直接由 log 得出。
 - AI 風險評審目前是單進程背景 worker，尚未接入外部消息隊列。
 
+## 交易收斂規則
+- LayerZero / Wormhole 在來源鏈發起時，只要 decode 後可確認 `from -> to` 屬於 `Ethereum <-> TARGET_CHAIN`，就會先建立交易記錄並顯示為 `In Progress`。
+- 目的鏈後續事件到達後，會合併到同一條 canonical 記錄並更新狀態。
+- 非目標鏈對或方向無法確認的事件，不會進入主表與前端列表。
+
 ## Dashboard 篩選
 - Dashboard 的 `Total / Executed / In Progress / Need Attention` 統計卡可點擊。
 - 每張統計卡除了總數，也會顯示 `LayerZero / Wormhole` 各自的數量拆分。

@@ -231,13 +231,19 @@ class NormalizerService:
         chain_sides: dict[str, dict[str, int | bool | None]],
         dual_chain_pair: tuple[int, int],
     ) -> set[str]:
-        """計算符合 Ethereum + TARGET_CHAIN 且具備雙邊鏈上證據的 canonical id 集合。"""
+        """計算可物化為交易主表的 canonical id 集合。
+
+        規則：
+        - 必須已能由解碼結果確認方向屬於 Ethereum <-> TARGET_CHAIN
+        - 必須至少有來源鏈發起證據，這樣才能在發起時先顯示為 in progress
+        - 若後續補到目的鏈證據，沿用同一 canonical id 更新狀態
+        """
         eth_chain_id, target_chain_id = dual_chain_pair
         output: set[str] = set()
         for canonical_id, sides in chain_sides.items():
             if bool(sides.get("conflict")):
                 continue
-            if not bool(sides.get("has_src_evidence")) or not bool(sides.get("has_dst_evidence")):
+            if not bool(sides.get("has_src_evidence")):
                 continue
             src = sides.get("src")
             dst = sides.get("dst")

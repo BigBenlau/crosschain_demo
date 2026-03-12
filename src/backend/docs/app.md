@@ -89,7 +89,9 @@
   - LayerZero 優先 `lz:{srcEid}:{sender}:{nonce}`，其次 `lz:{guid}`
   - Wormhole 使用 `wormhole:{emitterChainId}:{emitterAddress}:{sequence}`
   - 若解碼不足則回退 `protocol:chain_id:tx_hash:log_index`
-- 僅將 `Ethereum + TARGET_CHAIN` 雙邊交易寫入 `xchain_txs`，單邊或非目標鏈對事件不會進入主表。
+- 若來源鏈發起事件已能由 decode 明確確認為 `Ethereum <-> TARGET_CHAIN`，會先寫入 `xchain_txs` 並以 `SENT` 顯示為 in progress。
+- 目的鏈事件到達後，會沿用同一 canonical id 合併到既有記錄並推進為 `VERIFIED / EXECUTED / FAILED`。
+- 非目標鏈對、方向衝突或完全無法確認方向的事件不會進入主表。
 - `eth_getLogs` 的返回不包含區塊 timestamp，因此不額外調 block RPC 時，`src_timestamp/event_ts` 通常為空。
 - `latest` 會按 Ethereum 主網側最早事件的 `(block_number, log_index)` 倒序排序。
 - 會將 `raw_logs.data` 與 `raw_logs.decoded_json` 同步到 `xchain_timeline_events`，供 detail 頁展示 decode 結果。
