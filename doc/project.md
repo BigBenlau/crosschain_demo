@@ -34,12 +34,14 @@
 - `src/backend/app/indexer/service.py`
   - 逐鏈逐協議掃描 logs
   - 寫入 `raw_logs`
+  - 同步寫入 `raw_logs.canonical_id`
+  - 將受影響 canonical id 寫入持久化 normalization queue
   - 更新 `indexer_cursors`
 - `src/backend/app/decoder/service.py`
   - 解 LayerZero / Wormhole 事件
   - 產出 `canonical_hint` 與方向資訊
 - `src/backend/app/normalizer/service.py`
-  - 將 raw logs 聚合成 `xchain_txs`
+  - 按本輪受影響 canonical id 增量重建 `xchain_txs`
   - 建立 timeline 與 search index
   - 只保留 `Ethereum <-> TARGET_CHAIN` 的完整雙邊交易
   - 對失效 canonical id 做清理
@@ -49,6 +51,11 @@
   - 由背景 worker 按批次調用 AI 對多筆交易輸出風險結論
   - 默認對接智譜免費模型 `GLM-4.7-Flash`
   - 風險分數範圍 `0-100`，越高越安全
+- `src/backend/app/maintenance/service.py`
+  - 週期性清理 `raw_logs.removed`
+  - 清理超過保留期的 `EXECUTED` 交易 raw logs
+  - 將超過保留期的 `FAILED` 交易輸出為 gzip archive
+  - 依週期或刪除筆數門檻觸發 SQLite `VACUUM`
 - `src/backend/app/api/routes.py`
   - 提供 `latest/search/detail/stream/stats`
   - `stats` 會返回全局統計與 `LayerZero / Wormhole` 拆分統計

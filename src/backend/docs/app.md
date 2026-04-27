@@ -8,11 +8,12 @@
 - `main.py`：FastAPI 入口、生命週期管理（啟動 DB、啟動/停止 indexer）、`/api/health`
 - `config.py`：環境變數配置中心（鏈/RPC/indexer/topic/AI/DB）
 - `db.py`：SQLAlchemy engine/session 與 `init_db()`
-- `models/`：ORM schema（交易、時間線、raw logs、cursor、search、risk）
+- `models/`：ORM schema（交易、時間線、raw logs、cursor、search、risk、normalization queue、maintenance state）
 - `registry/`：鏈與協議註冊表（由 config 組裝）
 - `indexer/`：鏈上 RPC 掃描器（backfill + tailing）
 - `decoder/`：協議事件 ABI/data 解碼與 canonical 配對欄位提取
-- `normalizer/`：`raw_logs -> xchain_txs/timeline/search_index` 正規化
+- `normalizer/`：按 canonical id 增量將 `raw_logs -> xchain_txs/timeline/search_index` 正規化
+- `maintenance/`：背景資料清理、FAILED 歸檔、SQLite VACUUM 節奏控制
 - `risk/`：規則風險分析 + 可選 AI 補充
 - `api/`：`latest/search/tx/stream` 路由與回應模型
 
@@ -21,9 +22,10 @@
 2. `indexer/service.py` 每輪：
    - 讀取 `registry/chains.py`、`registry/protocols.py`
    - RPC 拉取 logs，透過 `decoder/service.py` 解析，再寫入 `raw_logs`
+   - 將受影響 canonical id 寫入 `normalization_tasks`
    - 更新 `indexer_cursors`
 3. 同一輪內呼叫 `normalizer/service.py`：
-   - 將 `raw_logs` 聚合為 `xchain_txs`
+   - 僅按本輪受影響 canonical id 從 `raw_logs` 重建 `xchain_txs`
    - 建立 `xchain_timeline_events` 與 `search_index`
    - 套用 `STUCK` 規則
 4. 接著呼叫 `risk/service.py`：
@@ -31,7 +33,12 @@
    - 將本輪變更交易送入待檢查池
    - 由背景 worker 按批次調用 AI 分析多筆交易
    - 寫入 `risk_reports`
-5. `api/routes.py` 對外提供查詢與 SSE 推送
+5. 背景 `maintenance/service.py` 週期性執行：
+   - 刪除 `removed = 1` 且超過保留期的 raw logs
+   - 刪除 `EXECUTED` 且超過保留期交易對應的 raw logs
+   - 將超過保留期的 `FAILED` 交易輸出為 gzip archive，但不刪 DB 內資料
+   - 依週期或累積刪除筆數門檻觸發 SQLite `VACUUM`
+6. `api/routes.py` 對外提供查詢與 SSE 推送
 
 ## 模組分工細節
 
@@ -43,6 +50,11 @@
 - AI 相關配置目前包含：
   - 基礎調模：`AI_API_KEY/AI_BASE_URL/AI_MODEL/AI_TIMEOUT_SECONDS`
   - 批量控制：`AI_BATCH_SIZE/AI_BATCH_MAX_SIZE/AI_MAX_PROMPT_CHARS/AI_MAX_OUTPUT_TOKENS/AI_TEMPERATURE`
+- 維護任務相關配置目前包含：
+  - `MAINTENANCE_ENABLED/MAINTENANCE_POLL_SECONDS`
+  - `MAINTENANCE_REMOVED_RETENTION_DAYS/MAINTENANCE_EXECUTED_RETENTION_DAYS`
+  - `MAINTENANCE_FAILED_ARCHIVE_RETENTION_DAYS/MAINTENANCE_ARCHIVE_DIR`
+  - `MAINTENANCE_VACUUM_INTERVAL_HOURS/MAINTENANCE_VACUUM_MIN_DELETED_ROWS`
 
 ### `models/tables.py`
 - 是資料結構單一來源（schema source of truth）
@@ -62,7 +74,7 @@
 - Wormhole 地址白名單同時包含：
   - core contracts
   - token bridge contracts
-- Wormhole 的 sender filter 僅用於 `SENT` 事件額外過濾非 bridge sender
+- Wormhole 的 sender filter 目前僅保留為 `SENT` 事件的輔助觀察配置；實際是否入庫仍以 decode 後的方向與允許鏈對判定為主
 - 若 Wormhole 的 `emitter_chain_id` / `src_wormhole_chain_id` / `dst_wormhole_chain_id` 不屬於 `Ethereum + TARGET_CHAIN`，會在 indexer 階段直接跳過，不寫入資料庫
 
 ### `indexer/service.py`
@@ -71,6 +83,7 @@
   - safe head 計算（`latest - finality_depth`）
   - chunk 掃描
   - raw log 去重 upsert（`chain_id + tx_hash + log_index`）
+  - 同步寫入 `raw_logs.canonical_id`
   - 寫入 `decoded_json`（協議事件 decode 結果）
   - cursor 前進與健康快照
 
@@ -85,6 +98,10 @@
 ### `normalizer/service.py`
 - 將協議事件映射為統一狀態：
   - `SENT/VERIFIED/EXECUTED/FAILED/STUCK`
+- 不再每輪全掃所有 `raw_logs`；改為只重建本輪受影響的 canonical 交易
+- 每個受影響 canonical id 仍會從其關聯 `raw_logs` 全量重算主表、timeline 與 search index，確保輸出與舊版收斂邏輯一致
+- 若發現舊 `raw_logs` 尚未帶 `canonical_id`，會先一次性回填，再進入增量重建
+- 待重建 canonical id 會持久化到 `normalization_tasks`，避免在 raw log 已提交但本輪 normalize 失敗時遺失重建任務
 - canonical id 生成策略：
   - LayerZero 優先 `lz:{srcEid}:{sender}:{nonce}`，其次 `lz:{guid}`
   - Wormhole 使用 `wormhole:{emitterChainId}:{emitterAddress}:{sequence}`
@@ -123,6 +140,31 @@
 - `lastError`
 - `lastEnqueuedIds`
 - `lastCompletedIds`
+
+### `maintenance/service.py`
+- 採 backend 內建背景 thread 執行，避免額外 container 對 SQLite 造成更多鎖競爭
+- 當前保守清理規則：
+  - `raw_logs.removed = 1`：保留 `7` 天後刪除
+  - `EXECUTED` 交易對應 `raw_logs`：保留 `60` 天後刪除
+  - `FAILED`：保留 DB 原始資料，但在 `60` 天後輸出 gzip archive
+  - `STUCK`：目前不刪
+- SQLite `VACUUM` 觸發策略：
+  - 距上次 VACUUM 已超過 `MAINTENANCE_VACUUM_INTERVAL_HOURS`
+  - 或累積刪除行數達到 `MAINTENANCE_VACUUM_MIN_DELETED_ROWS`
+  - 為避免無效鎖表，僅當自上次 VACUUM 起確實有刪除資料時才會執行
+
+`/api/health` 額外提供 `maintenance` 狀態：
+- `running`
+- `lastError`
+- `lastRunAt`
+- `lastDeletedRemovedLogs`
+- `lastDeletedExecutedLogs`
+- `lastArchivedFailedTxs`
+- `lastVacuumAt`
+- `lastVacuumReason`
+- `archiveDir`
+- `pollSeconds`
+- `enabled`
 
 ### `api/routes.py`
 - `GET /api/latest`

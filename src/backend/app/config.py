@@ -52,6 +52,16 @@ class Settings(BaseSettings):
     indexer_chunk_size: int
     stuck_timeout_minutes: int
 
+    # 背景清理與維護任務配置
+    maintenance_enabled: bool
+    maintenance_poll_seconds: int
+    maintenance_removed_retention_days: int
+    maintenance_executed_retention_days: int
+    maintenance_failed_archive_retention_days: int
+    maintenance_archive_dir: str
+    maintenance_vacuum_interval_hours: int
+    maintenance_vacuum_min_deleted_rows: int
+
     # 協議事件 topic0 配置（逗號分隔）
     layerzero_topic0s: str
     wormhole_topic0s: str

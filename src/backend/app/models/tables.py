@@ -76,6 +76,7 @@ class RawLog(Base):
     protocol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     chain_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     block_number: Mapped[int] = mapped_column(BIGINT, nullable=False, index=True)
+    canonical_id: Mapped[str | None] = mapped_column(String(191), nullable=True, index=True)
     tx_hash: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     log_index: Mapped[int] = mapped_column(Integer, nullable=False)
     block_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -83,6 +84,10 @@ class RawLog(Base):
     data: Mapped[str | None] = mapped_column(Text, nullable=True)
     decoded_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     removed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, server_default=func.now(), onupdate=func.now(), index=True
+    )
 
 
 class IndexerCursor(Base):
@@ -112,6 +117,29 @@ class SearchIndex(Base):
         String(191), ForeignKey("xchain_txs.canonical_id"), nullable=False, index=True
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+
+class NormalizationTask(Base):
+    """待正規化 canonical id 隊列表。"""
+
+    __tablename__ = "normalization_tasks"
+
+    canonical_id: Mapped[str] = mapped_column(String(191), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MaintenanceState(Base):
+    """維護任務的持久化狀態表。"""
+
+    __tablename__ = "maintenance_state"
+
+    state_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class RiskReport(Base):

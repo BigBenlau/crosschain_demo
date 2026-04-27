@@ -41,8 +41,21 @@ def _ensure_schema_compat() -> None:
             conn.execute(text("ALTER TABLE xchain_txs ADD COLUMN ethereum_log_index INTEGER"))
 
         raw_log_columns = _column_names("raw_logs")
+        if "canonical_id" not in raw_log_columns:
+            conn.execute(text("ALTER TABLE raw_logs ADD COLUMN canonical_id VARCHAR(191)"))
         if "block_timestamp" not in raw_log_columns:
             conn.execute(text("ALTER TABLE raw_logs ADD COLUMN block_timestamp DATETIME"))
+        if "created_at" not in raw_log_columns:
+            conn.execute(text("ALTER TABLE raw_logs ADD COLUMN created_at DATETIME"))
+        if "updated_at" not in raw_log_columns:
+            conn.execute(text("ALTER TABLE raw_logs ADD COLUMN updated_at DATETIME"))
+        conn.execute(
+            text(
+                "UPDATE raw_logs "
+                "SET created_at = COALESCE(created_at, block_timestamp, CURRENT_TIMESTAMP), "
+                "updated_at = COALESCE(updated_at, block_timestamp, created_at, CURRENT_TIMESTAMP)"
+            )
+        )
 
         timeline_columns = _column_names("xchain_timeline_events")
         if "decoded_json" not in timeline_columns:
@@ -53,8 +66,12 @@ def _ensure_schema_compat() -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_src_timestamp ON xchain_txs (src_timestamp)"))
 
         raw_logs_indexes = _index_names("raw_logs")
+        if "ix_raw_logs_canonical_id" not in raw_logs_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_raw_logs_canonical_id ON raw_logs (canonical_id)"))
         if "ix_raw_logs_block_timestamp" not in raw_logs_indexes:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_raw_logs_block_timestamp ON raw_logs (block_timestamp)"))
+        if "ix_raw_logs_updated_at" not in raw_logs_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_raw_logs_updated_at ON raw_logs (updated_at)"))
         if "ix_xchain_txs_ethereum_block_number" not in xchain_txs_indexes:
             conn.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_xchain_txs_ethereum_block_number ON xchain_txs (ethereum_block_number)")
@@ -75,6 +92,14 @@ def _ensure_schema_compat() -> None:
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_schema_compat()
+
+
+def run_sqlite_vacuum() -> None:
+    """對 SQLite 執行 VACUUM，非 SQLite 時直接跳過。"""
+    if not is_sqlite:
+        return
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("VACUUM"))
 
 
 def get_db() -> Generator[Session, None, None]:

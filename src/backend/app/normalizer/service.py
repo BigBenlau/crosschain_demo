@@ -11,11 +11,11 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import RawLog, RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
+from app.models import NormalizationTask, RawLog, RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
 from app.registry import get_protocol_registry
 
 
@@ -28,72 +28,99 @@ def _status_rank(status: str) -> int:
 class NormalizerService:
     """最小正規化服務，將原始日志聚合為統一交易視圖。"""
 
-    def normalize_all(self, db: Session, dual_chain_pair: tuple[int, int] | None = None) -> list[str]:
-        """執行全量正規化，回傳本輪變更的 canonical id 列表。"""
-        # 階段 0：前置條件。
-        # 僅在已解析出雙邊鏈配對（Ethereum + TARGET_CHAIN）時執行正規化；
-        # 若缺少配對資訊，直接返回空集合，避免誤寫入單邊交易。
+    def normalize_changed(
+        self,
+        db: Session,
+        changed_canonical_ids: set[str] | list[str] | None,
+        dual_chain_pair: tuple[int, int] | None = None,
+    ) -> list[str]:
+        """按本輪受影響 canonical id 增量重建交易視圖。"""
         if dual_chain_pair is None:
             return []
 
-        # 階段 1：初始化本輪上下文。
-        # - protocol_maps：topic0 -> stage 的快速映射
-        # - changed_ids：收集本輪有更新的 canonical id
-        # - seen_search_keys：同一輪內 search_index 去重
-        protocol_maps = {item.key: item.stage_by_topic for item in get_protocol_registry(settings)}
-        changed_ids: set[str] = set()
-        seen_search_keys: set[tuple[str, str, str]] = set()
+        protocol_maps = self._build_protocol_maps()
+        changed_ids: set[str] = set(changed_canonical_ids or [])
 
-        # 階段 2：掃描所有有效 raw logs，先整理為「可用事件」清單。
-        # 這一階段只做解析與歸類，不直接寫 xchain_txs，便於後續先做雙邊過濾。
-        stmt = select(RawLog).where(RawLog.removed.is_(False)).order_by(RawLog.block_number.asc(), RawLog.id.asc())
-        logs = db.execute(stmt).scalars().all()
-        staged_entries: list[tuple[RawLog, str, str, dict[str, Any] | None]] = []
-        chain_sides: dict[str, dict[str, int | bool | None]] = {}
-        for raw in logs:
-            entry = self._build_staged_entry(raw, protocol_maps)
-            if entry is None:
-                continue
-            staged_entries.append(entry)
-            self._accumulate_chain_sides(chain_sides, entry[2], raw, entry[1], dual_chain_pair, entry[3])
-
-        # 階段 3：計算符合雙邊條件的 canonical id（縮小處理場景）。
-        # 只保留：
-        # - 同一 canonical id 同時出現 src/dst
-        # - 方向可校驗且無衝突
-        # - 鏈對為 Ethereum <-> TARGET_CHAIN
-        eligible_ids = self._eligible_canonical_ids(chain_sides, dual_chain_pair)
-        changed_ids.update(self._prune_ineligible_transactions(db, eligible_ids))
-        if not eligible_ids:
-            changed_stuck = self._mark_stuck_transactions(db)
-            changed_ids.update(changed_stuck)
-            db.commit()
-            return list(changed_ids)
-
-        # 階段 4：僅針對 eligible canonical id 寫主表、時間線、搜索索引。
-        # 這是核心收斂步驟，避免單邊或錯向資料進入 xchain_txs。
-        for raw, stage, canonical_id, _decoded in staged_entries:
-            if canonical_id not in eligible_ids:
-                continue
-            tx = db.get(XChainTx, canonical_id)
-            if tx is None:
-                tx = XChainTx(canonical_id=canonical_id, protocol=raw.protocol, status="SENT")
-                db.add(tx)
-                db.flush()
-
-            changed = self._apply_stage(tx, raw, stage)
-            changed = self._upsert_timeline(db, raw, canonical_id, stage) or changed
-            changed = self._upsert_search_index(db, raw, canonical_id, seen_search_keys) or changed
-            if changed:
-                changed_ids.add(canonical_id)
-
-        # 階段 5：收尾規則與提交。
-        # 補標記超時未推進交易為 STUCK，再統一 commit。
+        # 首輪部署後，舊 raw_logs 仍然沒有 canonical_id。
+        # 先回填再增量重建，避免後續只拿到半邊事件而破壞收斂結果。
+        changed_ids.update(self._backfill_raw_log_canonical_ids(db))
+        self.enqueue_canonical_ids(db, changed_ids)
         db.flush()
-        changed_stuck = self._mark_stuck_transactions(db)
-        changed_ids.update(changed_stuck)
+
+        rebuilt_ids: set[str] = set()
+        pending_ids = self._load_pending_canonical_ids(db)
+        for canonical_id in pending_ids:
+            if self._rebuild_canonical(db, canonical_id, dual_chain_pair, protocol_maps):
+                rebuilt_ids.add(canonical_id)
+            self._clear_pending_canonical_id(db, canonical_id)
+
+        db.flush()
+        rebuilt_ids.update(self._mark_stuck_transactions(db))
         db.commit()
-        return list(changed_ids)
+        return list(rebuilt_ids)
+
+    def _build_protocol_maps(self) -> dict[str, dict[str, str]]:
+        """構建協議 topic0 -> stage 的快速映射。"""
+        return {item.key: item.stage_by_topic for item in get_protocol_registry(settings)}
+
+    def enqueue_canonical_ids(self, db: Session, canonical_ids: set[str] | list[str]) -> None:
+        """將待重建 canonical id 持久化到待處理隊列。"""
+        for canonical_id in canonical_ids:
+            if not canonical_id:
+                continue
+            task = db.get(NormalizationTask, canonical_id)
+            if task is None:
+                db.add(NormalizationTask(canonical_id=canonical_id))
+
+    def _load_pending_canonical_ids(self, db: Session) -> list[str]:
+        """載入所有待重建 canonical id。"""
+        stmt = select(NormalizationTask.canonical_id).order_by(NormalizationTask.updated_at.asc())
+        return [row[0] for row in db.execute(stmt).all()]
+
+    def _clear_pending_canonical_id(self, db: Session, canonical_id: str) -> None:
+        """在單個 canonical id 重建成功後移除其待處理標記。"""
+        db.execute(delete(NormalizationTask).where(NormalizationTask.canonical_id == canonical_id))
+
+    def build_canonical_id_for_values(
+        self,
+        protocol: str,
+        chain_id: int,
+        tx_hash: str,
+        log_index: int,
+        decoded: dict[str, Any] | None,
+    ) -> str:
+        """從原始欄位生成 canonical id，供 indexer 與 normalizer 共用。"""
+        if protocol == "layerzero":
+            layerzero_id = self._build_layerzero_canonical(decoded)
+            if layerzero_id is not None:
+                return layerzero_id
+        if protocol == "wormhole":
+            wormhole_id = self._build_wormhole_canonical(decoded)
+            if wormhole_id is not None:
+                return wormhole_id
+
+        if protocol == "layerzero":
+            return f"lz:{chain_id}:{tx_hash}:{log_index}"
+        if protocol == "wormhole":
+            return f"wormhole:{chain_id}:{tx_hash}:{log_index}"
+        return f"{protocol}:{chain_id}:{tx_hash}:{log_index}"
+
+    def _backfill_raw_log_canonical_ids(self, db: Session) -> set[str]:
+        """為舊資料回填 raw_logs.canonical_id。"""
+        stmt = select(RawLog).where(RawLog.canonical_id.is_(None)).order_by(RawLog.id.asc())
+        rows = db.execute(stmt).scalars().all()
+        changed_ids: set[str] = set()
+        for raw in rows:
+            decoded = self._load_decoded(raw.decoded_json)
+            raw.canonical_id = self.build_canonical_id_for_values(
+                protocol=raw.protocol,
+                chain_id=raw.chain_id,
+                tx_hash=raw.tx_hash,
+                log_index=raw.log_index,
+                decoded=decoded,
+            )
+            changed_ids.add(raw.canonical_id)
+        return changed_ids
 
     def _resolve_stage(self, protocol_maps: dict[str, dict[str, str]], protocol: str, topic0: str | None) -> str | None:
         """由協議與 topic0 解析統一階段。"""
@@ -111,19 +138,6 @@ class NormalizerService:
         except ValueError:
             return None
         return parsed if isinstance(parsed, dict) else None
-
-    def _build_canonical_id(self, raw: RawLog, decoded: dict[str, Any] | None) -> str:
-        """生成 canonical id：優先使用解碼結果，失敗時回退 fallback。"""
-        if raw.protocol == "layerzero":
-            layerzero_id = self._build_layerzero_canonical(decoded)
-            if layerzero_id is not None:
-                return layerzero_id
-        if raw.protocol == "wormhole":
-            wormhole_id = self._build_wormhole_canonical(decoded)
-            if wormhole_id is not None:
-                return wormhole_id
-
-        return self._build_fallback_canonical(raw)
 
     def _build_layerzero_canonical(self, decoded: dict[str, Any] | None) -> str | None:
         """按 LayerZero hint 生成 canonical id。"""
@@ -164,14 +178,6 @@ class NormalizerService:
             return f"wormhole:{emitter_chain_id}:{emitter_address.lower()}:{sequence}"
         return None
 
-    def _build_fallback_canonical(self, raw: RawLog) -> str:
-        """使用舊版 fallback 規則生成 canonical id。"""
-        if raw.protocol == "layerzero":
-            return f"lz:{raw.chain_id}:{raw.tx_hash}:{raw.log_index}"
-        if raw.protocol == "wormhole":
-            return f"wormhole:{raw.chain_id}:{raw.tx_hash}:{raw.log_index}"
-        return f"{raw.protocol}:{raw.chain_id}:{raw.tx_hash}:{raw.log_index}"
-
     def _build_staged_entry(
         self,
         raw: RawLog,
@@ -182,8 +188,77 @@ class NormalizerService:
         if stage is None:
             return None
         decoded = self._load_decoded(raw.decoded_json)
-        canonical_id = self._build_canonical_id(raw, decoded)
+        canonical_id = raw.canonical_id or self.build_canonical_id_for_values(
+            protocol=raw.protocol,
+            chain_id=raw.chain_id,
+            tx_hash=raw.tx_hash,
+            log_index=raw.log_index,
+            decoded=decoded,
+        )
         return (raw, stage, canonical_id, decoded)
+
+    def _rebuild_canonical(
+        self,
+        db: Session,
+        canonical_id: str,
+        dual_chain_pair: tuple[int, int],
+        protocol_maps: dict[str, dict[str, str]],
+    ) -> bool:
+        """按單個 canonical id 從頭重建主表、timeline 與 search 索引。"""
+        stmt = (
+            select(RawLog)
+            .where(RawLog.canonical_id == canonical_id, RawLog.removed.is_(False))
+            .order_by(RawLog.block_number.asc(), RawLog.id.asc())
+        )
+        logs = db.execute(stmt).scalars().all()
+
+        staged_entries: list[tuple[RawLog, str, str, dict[str, Any] | None]] = []
+        chain_sides: dict[str, dict[str, int | bool | None]] = {}
+        for raw in logs:
+            entry = self._build_staged_entry(raw, protocol_maps)
+            if entry is None:
+                continue
+            staged_entries.append(entry)
+            self._accumulate_chain_sides(chain_sides, canonical_id, raw, entry[1], dual_chain_pair, entry[3])
+
+        eligible_ids = self._eligible_canonical_ids(chain_sides, dual_chain_pair)
+        if canonical_id not in eligible_ids or not staged_entries:
+            return self._prune_canonical_transaction(db, canonical_id)
+
+        tx = db.get(XChainTx, canonical_id)
+        if tx is None:
+            tx = XChainTx(canonical_id=canonical_id, protocol=staged_entries[0][0].protocol, status="SENT")
+            db.add(tx)
+            db.flush()
+
+        self._reset_tx(tx, protocol=staged_entries[0][0].protocol)
+        db.execute(delete(XChainTimelineEvent).where(XChainTimelineEvent.canonical_id == canonical_id))
+        db.execute(delete(SearchIndex).where(SearchIndex.canonical_id == canonical_id))
+
+        seen_search_keys: set[tuple[str, str, str]] = set()
+        for raw, stage, _staged_canonical_id, _decoded in staged_entries:
+            self._apply_stage(tx, raw, stage)
+            self._upsert_timeline(db, raw, canonical_id, stage)
+            self._upsert_search_index(db, raw, canonical_id, seen_search_keys)
+
+        return True
+
+    def _reset_tx(self, tx: XChainTx, protocol: str) -> None:
+        """清空交易主表的派生欄位，便於從 raw logs 完整重建。"""
+        tx.protocol = protocol
+        tx.src_chain_id = None
+        tx.src_tx_hash = None
+        tx.src_timestamp = None
+        tx.ethereum_block_number = None
+        tx.ethereum_log_index = None
+        tx.dst_chain_id = None
+        tx.dst_tx_hash = None
+        tx.dst_timestamp = None
+        tx.status = "SENT"
+        tx.failure_category = None
+        tx.latency_ms_total = None
+        tx.latency_ms_verify = None
+        tx.latency_ms_execute = None
 
     def _accumulate_chain_sides(
         self,
@@ -231,13 +306,7 @@ class NormalizerService:
         chain_sides: dict[str, dict[str, int | bool | None]],
         dual_chain_pair: tuple[int, int],
     ) -> set[str]:
-        """計算可物化為交易主表的 canonical id 集合。
-
-        規則：
-        - 必須已能由解碼結果確認方向屬於 Ethereum <-> TARGET_CHAIN
-        - 必須至少有來源鏈發起證據，這樣才能在發起時先顯示為 in progress
-        - 若後續補到目的鏈證據，沿用同一 canonical id 更新狀態
-        """
+        """計算可物化為交易主表的 canonical id 集合。"""
         eth_chain_id, target_chain_id = dual_chain_pair
         output: set[str] = set()
         for canonical_id, sides in chain_sides.items():
@@ -486,8 +555,6 @@ class NormalizerService:
         entries = self._build_search_entries(raw, canonical_id)
         for key_type, key_value, source in entries:
             key = (key_type, key_value, canonical_id)
-
-            # 先用記憶體集合去重，避免同一輪 session 內重複 add 造成 unique 衝突。
             if key in seen_search_keys:
                 continue
 
@@ -521,7 +588,7 @@ class NormalizerService:
         stmt = select(XChainTx).where(
             and_(
                 XChainTx.status.in_(["SENT", "VERIFIED"]),
-                or_(XChainTx.updated_at <= threshold, XChainTx.created_at <= threshold),
+                XChainTx.updated_at <= threshold,
             )
         )
         rows = db.execute(stmt).scalars().all()
@@ -535,20 +602,16 @@ class NormalizerService:
             changed.append(tx.canonical_id)
         return changed
 
-    def _prune_ineligible_transactions(self, db: Session, eligible_ids: set[str]) -> list[str]:
-        """刪除已失去有效鏈上證據的交易及其關聯資料。"""
-        stmt = select(XChainTx.canonical_id)
-        if eligible_ids:
-            stmt = stmt.where(XChainTx.canonical_id.not_in(eligible_ids))
-        existing_ids = [row[0] for row in db.execute(stmt).all()]
-        if not existing_ids:
-            return []
-
-        db.execute(delete(RiskReport).where(RiskReport.canonical_id.in_(existing_ids)))
-        db.execute(delete(XChainTimelineEvent).where(XChainTimelineEvent.canonical_id.in_(existing_ids)))
-        db.execute(delete(SearchIndex).where(SearchIndex.canonical_id.in_(existing_ids)))
-        db.execute(delete(XChainTx).where(XChainTx.canonical_id.in_(existing_ids)))
-        return existing_ids
+    def _prune_canonical_transaction(self, db: Session, canonical_id: str) -> bool:
+        """刪除單個已失去有效鏈上證據的交易及其關聯資料。"""
+        tx = db.get(XChainTx, canonical_id)
+        has_tx = tx is not None
+        db.execute(delete(RiskReport).where(RiskReport.canonical_id == canonical_id))
+        db.execute(delete(XChainTimelineEvent).where(XChainTimelineEvent.canonical_id == canonical_id))
+        db.execute(delete(SearchIndex).where(SearchIndex.canonical_id == canonical_id))
+        if tx is not None:
+            db.delete(tx)
+        return has_tx
 
 
 normalizer_service = NormalizerService()

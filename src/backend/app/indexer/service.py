@@ -287,6 +287,7 @@ class IndexerService:
         total_chunks = 0
         total_rpc_logs = 0
         total_upserted = 0
+        changed_canonical_ids: set[str] = set()
 
         with SessionLocal() as db:
             # 階段 2：逐鏈掃描。
@@ -312,7 +313,7 @@ class IndexerService:
                 # - Wormhole SENT 事件再套 sender 白名單
                 # - 返回 chunk/rpc_logs/upserted 三項統計
                 for protocol in protocols:
-                    chunks, rpc_logs, upserted = self._scan_protocol(
+                    chunks, rpc_logs, upserted, protocol_changed_ids = self._scan_protocol(
                         db,
                         chain.chain_id,
                         chain.key,
@@ -328,6 +329,7 @@ class IndexerService:
                     total_chunks += chunks
                     total_rpc_logs += rpc_logs
                     total_upserted += upserted
+                    changed_canonical_ids.update(protocol_changed_ids)
 
                 # 2.4 更新健康狀態快照：記錄本鏈最後索引到的 safe head。
                 with self._lock:
@@ -336,7 +338,11 @@ class IndexerService:
             # 階段 3：正規化與風險分析。
             # - normalize：將 raw_logs 聚合為 xchain_txs / timeline / search_index
             # - risk：將本輪變更交易送入異步風險評審隊列
-            changed_ids = normalizer_service.normalize_all(db, dual_chain_pair=dual_chain_pair)
+            changed_ids = normalizer_service.normalize_changed(
+                db,
+                changed_canonical_ids=changed_canonical_ids,
+                dual_chain_pair=dual_chain_pair,
+            )
             risk_updated = risk_service.analyze_transactions(db, changed_ids)
 
             # 階段 4：回寫本輪結果快照，供 /api/health 與觀察使用。
@@ -388,17 +394,17 @@ class IndexerService:
         contract_addresses: list[str],
         sent_topics: list[str],
         sent_sender_filter: list[str],
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, set[str]]:
         """掃描單鏈單協議的區塊範圍，並持續推進游標。"""
         # 階段 1：輸入校驗。
         # - 沒有 topic 無法構建事件過濾條件
         # - 沒有協議地址白名單則跳過，避免抓到非目標合約噪音
         if not topics:
             logger.warning("Skip scan: chain=%s protocol=%s has no topics configured", chain_key, protocol_key)
-            return (0, 0, 0)
+            return (0, 0, 0, set())
         if not contract_addresses:
             logger.warning("Skip scan: chain=%s protocol=%s has no contract addresses configured", chain_key, protocol_key)
-            return (0, 0, 0)
+            return (0, 0, 0, set())
 
         # 階段 2：定位掃描起點（cursor 續跑）。
         # - 首次掃描用 start_block
@@ -408,22 +414,24 @@ class IndexerService:
 
         # 階段 3：若當前起點已超過 safe head，代表本輪無需掃描。
         if next_block > safe_head:
-            return (0, 0, 0)
+            return (0, 0, 0, set())
 
         # 階段 4：初始化本協議本鏈統計與掃描參數。
         chunk_size = max(1, settings.indexer_chunk_size)
         scanned_chunks = 0
         total_rpc_logs = 0
         total_upserted = 0
+        changed_canonical_ids: set[str] = set()
         range_from = next_block
         range_to = next_block
         sent_topic_set = {item.lower() for item in sent_topics}
         sent_sender_filter_set = {item.lower() for item in sent_sender_filter}
 
-        # 階段 5：Wormhole SENT sender 過濾提示。
-        # 若已配置 SENT topic 但 sender 白名單為空，SENT 事件會被全部跳過。
+        # 階段 5：Wormhole SENT sender 配置提示。
+        # 目前 SENT 事件是否入庫主要取決於 decode 後能否確認方向；
+        # sender 白名單僅作輔助配置觀察，不再決定是否整批跳過。
         if protocol_key == "wormhole" and sent_topic_set and not sent_sender_filter_set:
-            logger.warning("Wormhole SENT sender filter empty: chain=%s", chain_key)
+            logger.warning("Wormhole SENT sender filter empty; direction-based gating remains active: chain=%s", chain_key)
 
         # 階段 6：分塊掃描區塊區間。
         # 每個 chunk 會：
@@ -440,7 +448,7 @@ class IndexerService:
                 chain_key=chain_key,
                 addresses=contract_addresses,
             )
-            upserted = self._upsert_raw_logs(
+            upserted, upserted_canonical_ids = self._upsert_raw_logs(
                 db,
                 protocol_key,
                 chain_id,
@@ -451,6 +459,7 @@ class IndexerService:
             scanned_chunks += 1
             total_rpc_logs += len(logs)
             total_upserted += upserted
+            changed_canonical_ids.update(upserted_canonical_ids)
             range_to = end_block
 
             if cursor is None:
@@ -474,7 +483,7 @@ class IndexerService:
             total_rpc_logs,
             total_upserted,
         )
-        return (scanned_chunks, total_rpc_logs, total_upserted)
+        return (scanned_chunks, total_rpc_logs, total_upserted, changed_canonical_ids)
 
     def _upsert_raw_logs(
         self,
@@ -484,10 +493,11 @@ class IndexerService:
         logs: list[dict],
         sent_topic_set: set[str],
         sent_sender_filter_set: set[str],
-    ) -> int:
+    ) -> tuple[int, set[str]]:
         """將 RPC logs 寫入 `raw_logs`，同位置資料以更新方式去重。"""
         # 階段 1：初始化本批次寫入計數器。
         upserted_count = 0
+        changed_canonical_ids: set[str] = set()
 
         # 階段 2：逐筆處理 RPC 回傳 log。
         # 每筆 log 依序完成：
@@ -529,6 +539,14 @@ class IndexerService:
             if not tx_hash or log_index is None or block_number is None:
                 continue
 
+            canonical_id = normalizer_service.build_canonical_id_for_values(
+                protocol=protocol_key,
+                chain_id=chain_id,
+                tx_hash=tx_hash,
+                log_index=log_index,
+                decoded=decoded_payload,
+            )
+
             # 2.5 以唯一鍵查詢是否已存在（chain_id + tx_hash + log_index）。
             stmt = select(RawLog).where(
                 RawLog.chain_id == chain_id, RawLog.tx_hash == tx_hash, RawLog.log_index == log_index
@@ -537,8 +555,11 @@ class IndexerService:
 
             # 2.6 存在則更新（含 reorg removed 與最新 decode 結果）。
             if existing:
+                if existing.canonical_id:
+                    changed_canonical_ids.add(existing.canonical_id)
                 existing.protocol = protocol_key
                 existing.block_number = block_number
+                existing.canonical_id = canonical_id
                 existing.topic0 = topic0
                 existing.data = entry.get("data")
                 existing.decoded_json = decoded_json
@@ -551,6 +572,7 @@ class IndexerService:
                         protocol=protocol_key,
                         chain_id=chain_id,
                         block_number=block_number,
+                        canonical_id=canonical_id,
                         tx_hash=tx_hash,
                         log_index=log_index,
                         topic0=topic0,
@@ -560,9 +582,11 @@ class IndexerService:
                     )
                 )
                 upserted_count += 1
+            changed_canonical_ids.add(canonical_id)
 
         # 階段 3：返回本批次成功 upsert 的筆數（新增 + 更新）。
-        return upserted_count
+        normalizer_service.enqueue_canonical_ids(db, changed_canonical_ids)
+        return (upserted_count, changed_canonical_ids)
 
     def _should_skip_wormhole_sent_log(
         self,

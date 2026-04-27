@@ -53,3 +53,5 @@ yarn-error.log*
 
 
 *.pdf
+
+docker-compose_own.yml

@@ -29,9 +29,10 @@
 1. `src/backend/app/main.py` 啟動應用，先建表，再啟動背景 indexer。
 2. `src/backend/app/indexer/service.py` 依鏈與協議掃描 logs，寫入 `raw_logs` 與 `indexer_cursors`。
 3. `src/backend/app/decoder/service.py` 解析 LayerZero / Wormhole 事件，產出 `decoded_json`。
-4. `src/backend/app/normalizer/service.py` 將有效事件聚合為 `xchain_txs`、`xchain_timeline_events`、`search_index`。
+4. `src/backend/app/normalizer/service.py` 按受影響 canonical id 增量重建 `xchain_txs`、`xchain_timeline_events`、`search_index`。
 5. `src/backend/app/risk/service.py` 對本輪變更交易產出 `risk_reports`。
-6. `src/backend/app/api/routes.py` 對外提供查詢與 SSE。
+6. `src/backend/app/maintenance/service.py` 週期性清理 `raw_logs`、歸檔 `FAILED`、並按策略執行 SQLite `VACUUM`。
+7. `src/backend/app/api/routes.py` 對外提供查詢與 SSE。
 
 ## 5. 目錄與模組
 - `src/backend/app/main.py`

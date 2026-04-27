@@ -14,6 +14,7 @@ from app.api import router as api_router
 from app.config import settings
 from app.db import init_db
 from app.indexer import indexer_service
+from app.maintenance import maintenance_service
 from app.risk import risk_service
 
 
@@ -22,9 +23,11 @@ async def lifespan(_: FastAPI):
     init_db()
     risk_service.start()
     indexer_service.start()
+    maintenance_service.start()
     try:
         yield
     finally:
+        maintenance_service.stop()
         indexer_service.stop()
         risk_service.stop()
 
@@ -37,6 +40,7 @@ app.include_router(api_router)
 def health() -> dict:
     snapshot = indexer_service.snapshot()
     risk_snapshot = risk_service.snapshot()
+    maintenance_snapshot = maintenance_service.snapshot()
     return {
         "api": "ok",
         "env": settings.app_env,
@@ -63,5 +67,18 @@ def health() -> dict:
             "lastError": risk_snapshot.last_error,
             "lastEnqueuedIds": risk_snapshot.last_enqueued_ids,
             "lastCompletedIds": risk_snapshot.last_completed_ids,
+        },
+        "maintenance": {
+            "running": maintenance_snapshot.running,
+            "lastError": maintenance_snapshot.last_error,
+            "lastRunAt": maintenance_snapshot.last_run_at,
+            "lastDeletedRemovedLogs": maintenance_snapshot.last_deleted_removed_logs,
+            "lastDeletedExecutedLogs": maintenance_snapshot.last_deleted_executed_logs,
+            "lastArchivedFailedTxs": maintenance_snapshot.last_archived_failed_txs,
+            "lastVacuumAt": maintenance_snapshot.last_vacuum_at,
+            "lastVacuumReason": maintenance_snapshot.last_vacuum_reason,
+            "archiveDir": maintenance_snapshot.archive_dir,
+            "pollSeconds": maintenance_snapshot.poll_seconds,
+            "enabled": settings.maintenance_enabled,
         },
     }

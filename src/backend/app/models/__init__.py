@@ -4,7 +4,16 @@
 """
 
 from app.models.base import Base
-from app.models.tables import IndexerCursor, RawLog, RiskReport, SearchIndex, XChainTimelineEvent, XChainTx
+from app.models.tables import (
+    IndexerCursor,
+    MaintenanceState,
+    NormalizationTask,
+    RawLog,
+    RiskReport,
+    SearchIndex,
+    XChainTimelineEvent,
+    XChainTx,
+)
 
 __all__ = [
     "Base",
@@ -13,5 +22,7 @@ __all__ = [
     "RawLog",
     "IndexerCursor",
     "SearchIndex",
+    "NormalizationTask",
+    "MaintenanceState",
     "RiskReport",
 ]

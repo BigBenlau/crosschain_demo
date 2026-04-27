@@ -6,7 +6,7 @@
 - 提供最小可用功能：`latest`、`search`、`tx detail`、`SSE stream`、風險分析
 
 ## 目錄結構
-- `src/backend`：FastAPI + SQLite + Indexer + Normalizer + Risk
+- `src/backend`：FastAPI + SQLite + Indexer + Normalizer + Risk + Maintenance Cleanup
 - `src/frontend`：React + Vite 最小展示介面
 - `plan.md`：開發計劃與規範
 
@@ -78,6 +78,7 @@ npm run dev
 - `AI_MAX_PROMPT_CHARS`
 - `AI_MAX_OUTPUT_TOKENS`
 - `AI_TEMPERATURE`
+- `MAINTENANCE_*`
 
 AI 默認配置：
 - 默認走智譜 OpenAI-compatible 接口
@@ -85,6 +86,14 @@ AI 默認配置：
 - 默認批量分析：`5` 筆 / 批，最大 `10` 筆 / 批
 - AI 評審由背景異步 worker 從待檢查池中批量取交易執行
 - AI 分數為 `0-100`，分數越高表示越安全，分數越低表示風險越高
+
+背景清理默認配置：
+- 由 backend 內建背景 worker 自動執行
+- `raw_logs.removed = 1`：保留 `7` 天後刪除
+- `EXECUTED` 交易對應 `raw_logs`：保留 `60` 天後刪除
+- `FAILED`：保留 DB 原始資料，但在 `60` 天後輸出 gzip archive
+- `STUCK`：目前不刪
+- SQLite `VACUUM`：按週期或累積刪除行數門檻觸發，不會每次 cleanup 後都執行
 
 Topic 參考：
 - `src/backend/docs/protocol_topics.md`

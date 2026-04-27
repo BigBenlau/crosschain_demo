@@ -13,18 +13,19 @@
 - `xchain_txs`
 - `xchain_timeline_events`
 - `raw_logs`
+- `normalization_tasks`
+- `maintenance_state`
 - `indexer_cursors`
 - `search_index`
 - `risk_reports`
 
 ## 目前「雙鏈完整跨鏈交易」判斷
 - 主表為：`xchain_txs`。
-- 目前代碼下，`xchain_txs` 僅保留同時具備來源與目的鏈，且鏈對為 `Ethereum(1) + TARGET_CHAIN` 的交易。
-- 判斷條件（同一行）：
-  - `src_chain_id IS NOT NULL`
-  - `dst_chain_id IS NOT NULL`
-- `src_chain_id/dst_chain_id` 需符合 `{1, target_chain_id}` 配對（方向可互換）。
-- 單邊或非目標鏈對事件不會寫入 `xchain_txs`（僅保留在 `raw_logs` 作鏈上原始證據）。
+- 目前代碼下，只要來源鏈發起事件已能由 decode 明確確認方向屬於 `Ethereum(1) + TARGET_CHAIN`，就會先寫入 `xchain_txs`。
+- 因此：
+  - `SENT` 中間態交易可以只有來源鏈證據
+  - `VERIFIED / EXECUTED / FAILED` 會在後續補齊目的鏈證據
+- 非目標鏈對、方向衝突或完全無法確認方向的事件不會寫入 `xchain_txs`（僅保留在 `raw_logs` 作鏈上原始證據）。
 - 若後續 reorg 使某筆交易失去有效雙邊證據，normalizer 會同步清理主表與關聯表資料。
 
 ## `xchain_txs`
@@ -79,6 +80,7 @@
 | `protocol` | `String(32)` | 否 | `INDEX` | 該 log 對應的協議。 |
 | `chain_id` | `Integer` | 否 | `INDEX` | 發生鏈。 |
 | `block_number` | `BIGINT` | 否 | `INDEX` | 區塊高度。 |
+| `canonical_id` | `String(191)` | 是 | `INDEX` | 該 log 當前對應的 canonical id，供 normalizer 按交易增量重建使用。 |
 | `tx_hash` | `String(80)` | 否 | `INDEX` | 交易哈希。 |
 | `log_index` | `Integer` | 否 | 唯一約束成員 | 交易中的 log 序號。 |
 | `block_timestamp` | `DateTime(timezone=True)` | 是 | `INDEX` | 所在區塊時間；當前默認不主動請求 block RPC，因此通常為空。 |
@@ -86,6 +88,8 @@
 | `data` | `Text` | 是 | - | 原始 data 欄位。 |
 | `decoded_json` | `Text` | 是 | - | 解析後內容（JSON 字串）。 |
 | `removed` | `Boolean` | 否 | default | 是否因 reorg 被移除。 |
+| `created_at` | `DateTime(timezone=True)` | 是 | server default | 原始 log 建立時間。 |
+| `updated_at` | `DateTime(timezone=True)` | 是 | `INDEX`, server default + onupdate | 原始 log 最後更新時間；cleanup 保留期主要使用此欄位。 |
 
 ## `indexer_cursors`
 用途：記錄 indexer 在每條鏈、每個協議的掃描進度。
@@ -100,6 +104,23 @@
 | `from_block` | `BIGINT` | 是 | - | 上次掃描起始區塊。 |
 | `to_block` | `BIGINT` | 是 | - | 上次掃描結束區塊。 |
 | `updated_at` | `DateTime(timezone=True)` | 否 | server default + onupdate | 游標更新時間。 |
+
+## `normalization_tasks`
+用途：持久化待重建 canonical id，避免 raw log 已提交但正規化未完成時丟失增量任務。
+
+| 欄位 | 型別 | 可為空 | 主鍵/索引/約束 | 含義 |
+|---|---|---|---|---|
+| `canonical_id` | `String(191)` | 否 | `PRIMARY KEY` | 待正規化的 canonical id。 |
+| `updated_at` | `DateTime(timezone=True)` | 否 | server default + onupdate | 最近一次入隊時間。 |
+
+## `maintenance_state`
+用途：持久化背景清理與 `VACUUM` 的維護狀態。
+
+| 欄位 | 型別 | 可為空 | 主鍵/索引/約束 | 含義 |
+|---|---|---|---|---|
+| `state_key` | `String(128)` | 否 | `PRIMARY KEY` | 狀態鍵，例如 `cleanup.last_vacuum_at`。 |
+| `state_value` | `Text` | 是 | - | 狀態值（字串化存儲）。 |
+| `updated_at` | `DateTime(timezone=True)` | 否 | server default + onupdate | 狀態最近更新時間。 |
 
 ## `search_index`
 用途：支援查詢 key 到 `canonical_id` 的映射。
@@ -161,6 +182,13 @@ WHERE src_chain_id IS NOT NULL
 
 ## 實作備註
 - `updated_at` 會作為 `STUCK` 超時判斷的主要時間基準。
+- `raw_logs.canonical_id` 是 normalizer 的增量索引鍵；部署新版本後，系統會在首輪運行時為舊資料自動回填。
+- `normalization_tasks` 是增量正規化的持久化隊列；只要 raw log 寫入成功，即使本輪 normalize 失敗，下一輪仍可補做。
+- 背景 cleanup 當前只會刪除：
+  - `removed = 1` 且超過保留期的 raw logs
+  - `EXECUTED` 且超過保留期交易對應的 raw logs
+- `FAILED` 交易目前只會輸出 gzip archive，不會刪除 DB 內原始資料。
+- `maintenance_state` 目前用於記錄 `VACUUM` 的最近執行時間與累積刪除行數。
 - `risk_reports` 不是歷史版本表；目前代碼會更新同一筆交易的最新分析結果。
 - `latency_ms_total`、`latency_ms_verify`、`latency_ms_execute` 欄位目前仍保留為空。
 - `eth_getLogs` 的 log 本身不包含區塊 timestamp，因此若不額外調 `eth_getBlockByNumber`，`src_timestamp/event_ts/block_timestamp` 會保持為空。
